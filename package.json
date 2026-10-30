@@ -1,0 +1,40 @@
+{
+  "name": "family-vault",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "deploy": "npm run build && wrangler deploy",
+    "typecheck": "tsc -b --pretty false",
+    "test": "vitest run --config vitest.config.ts",
+    "test:watch": "vitest --config vitest.config.ts",
+    "db:migrate:local": "wrangler d1 migrations apply family-vault-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply family-vault-db --remote",
+    "db:seed:family": "wrangler d1 execute family-vault-db --local --file db/seed-family-tree.sql && wrangler d1 execute family-vault-db --local --file db/seed-family-genders.sql",
+    "cf-typegen": "wrangler types"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "lucide-react": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "react-router-dom": "latest",
+    "vite": "latest"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "latest",
+    "@cloudflare/workers-types": "latest",
+    "@testing-library/jest-dom": "latest",
+    "@testing-library/react": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "@types/node": "latest",
+    "jsdom": "27.0.1",
+    "typescript": "latest",
+    "vitest": "latest",
+    "wrangler": "latest"
+  },
+  "engines": { "node": ">=20.19" }
+}

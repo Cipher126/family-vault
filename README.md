@@ -15,7 +15,7 @@ A private, invitation-only family photo archive built with React, TypeScript, Cl
 
 ## Requirements
 
-- Node.js 20.19 or later
+- Node.js 22.13 or later (the regression tests use built-in SQLite)
 - A Cloudflare account for deployment
 - Wrangler authentication (`npx wrangler login`)
 - R2 activation. Cloudflare currently requires completing R2's checkout/subscription flow, even when usage remains inside the free allowance. This project does not create or activate paid resources for you.

@@ -1,8 +1,25 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { sessionCookieSecurity } from "../worker/lib/auth";
 import { hashPassword, securityHeaders, sha256, validatePassword, verifyPassword } from "../worker/lib/security";
 
 describe("authentication primitives", () => {
+  it("hashes and verifies passwords below the hosted Workers iteration limit", async () => {
+    const deriveBits = crypto.subtle.deriveBits.bind(crypto.subtle);
+    const hostedCrypto = vi.spyOn(crypto.subtle, "deriveBits").mockImplementation((algorithm, key, length) => {
+      if (typeof algorithm === "object" && "iterations" in algorithm && Number(algorithm.iterations) >= 100_000) {
+        throw new DOMException("PBKDF2 iteration limit exceeded", "NotSupportedError");
+      }
+      return deriveBits(algorithm, key, length);
+    });
+    try {
+      const hash = await hashPassword("Private family password 42");
+      expect(await verifyPassword("Private family password 42", hash)).toBe(true);
+      expect(await verifyPassword("Wrong family password 42", hash)).toBe(false);
+    } finally {
+      hostedCrypto.mockRestore();
+    }
+  });
+
   it("hashes passwords with a random salt and verifies without storing plaintext", async () => {
     const first = await hashPassword("Long family password 42");
     const second = await hashPassword("Long family password 42");

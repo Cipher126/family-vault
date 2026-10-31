@@ -4,7 +4,7 @@ R2 is the primary object store, not a complete backup. Account mistakes, malicio
 
 ## Recommended no-subscription routine
 
-For the simplest family-readable backup, sign in as an administrator and open **Admin → Storage → Full archive**. The downloaded `.tar` contains `family-vault-metadata.json` plus the best available copy of every photograph (the preserved original when enabled, otherwise the optimized gallery copy). Windows 11, macOS, and common archive applications can extract TAR files.
+For the simplest family-readable backup, sign in as an administrator and open **Admin → Storage → Full archive**. The downloaded `.tar` contains `family-vault-metadata.json` including relatives, relationships, photo tags, shared memories and their photo membership, plus the best available copy of every photograph (the preserved original when enabled, otherwise the optimized gallery copy). Windows 11, macOS, and common archive applications can extract TAR files.
 
 Store that archive on an encrypted external drive and open several photographs after every download. This protects the memories in a portable format, but the provider-level export below is still the fastest way to restore the live application exactly as it was.
 

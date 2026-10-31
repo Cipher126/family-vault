@@ -76,9 +76,10 @@ describe("archive search", () => {
 describe("scrollable photo viewer", () => {
   it("keeps navigation outside the scrolling strip and contains portrait images", () => {
     expect(app).toContain('className="viewer-stage"');
-    expect(app).toContain('className="viewer-image"');
-    expect(app.indexOf('className="viewer-stage"')).toBeLessThan(app.indexOf('className="viewer-image"'));
-    expect(app.indexOf('className="viewer-image"')).toBeLessThan(app.indexOf('className="viewer-prev"'));
+    const strip = app.indexOf('<div ref={stripRef} className=');
+    expect(app.slice(strip,strip+100)).toContain('viewer-image');
+    expect(app.indexOf('className="viewer-stage"')).toBeLessThan(strip);
+    expect(strip).toBeLessThan(app.indexOf('className="viewer-prev"'));
     expect(styles).toContain(".viewer-stage .viewer-image{width:100%;height:100%}");
     expect(styles).toContain(".viewer:not(.fullscreen-view) .viewer-slide img");
     expect(styles).toContain("max-height:100%");
@@ -86,8 +87,8 @@ describe("scrollable photo viewer", () => {
 
   it("loads the preserved full photograph and never crops it in the viewer", () => {
     expect(app).toContain('photoUrl(item.id, "viewer")');
-    expect(routes).toContain('(thumbnail|gallery|viewer|original)');
-    const handler = routes.match(/async function servePhoto[\s\S]*?\n}/)?.[0] || "";
+    expect(routes).toContain('(small|thumbnail|gallery|viewer|original)');
+    const handler = routes.match(/async function deliverPhoto[\s\S]*?\n}/)?.[0] || "";
     expect(handler).toContain('variant === "viewer"');
     expect(handler).toContain("photo.original_key || photo.gallery_key");
     expect(styles).toContain(".viewer-slide{position:relative");

@@ -1,7 +1,8 @@
 import type { Env } from "../types";
 
 const encoder = new TextEncoder();
-const PASSWORD_ITERATIONS = 310_000;
+// Keep each derivation below the hosted Workers PBKDF2 iteration limit.
+const PASSWORD_ITERATIONS = 99_000;
 
 export function randomToken(bytes = 32): string {
   const data = crypto.getRandomValues(new Uint8Array(bytes));

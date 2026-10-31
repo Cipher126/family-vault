@@ -1,7 +1,12 @@
-import type { RequestContext } from "../types";
+import {collectionOffset,collectionPage} from "../lib/pagination";
+import type { Env, RequestContext } from "../types";
 import { createSession, deleteSession, expiredSessionCookie, requireAdmin, requireUser } from "../lib/auth";
 import { emailAddress, HttpError, json, readJson, requireSameOrigin } from "../lib/http";
 import { rateLimit } from "../lib/rate-limit";
+import {sessionTokenHash} from "../lib/auth";
+import {photoAccessPredicate} from "../lib/photo-access";
+import { photoQuery } from "../lib/photo-query";
+import { matchesMediaTag, mediaCacheHeaders } from "../lib/media-cache";
 import { cleanText, hashPassword, randomToken, sha256, uuid, validatePassword, verifyPassword } from "../lib/security";
 
 type Body = Record<string, unknown>;
@@ -27,6 +32,9 @@ export async function api(ctx: RequestContext): Promise<Response> {
   if (method === "GET" && url.pathname === "/api/config") return json({ siteName: await setting(ctx.env, "site_name") || "Family Vault" });
 
   const user = requireUser(ctx.user);
+  if (url.pathname === "/api/memories" && method === "GET") return listMemories(ctx);
+  if (url.pathname === "/api/memories" && method === "POST") return createMemory(ctx);
+  if (url.pathname === "/api/photos/bulk" && method === "PATCH") return bulkEditPhotos(ctx);
   if (method === "GET" && url.pathname === "/api/dashboard") return dashboard(ctx);
   if (method === "GET" && url.pathname === "/api/albums") return listAlbums(ctx);
   if (method === "POST" && url.pathname === "/api/albums") return createAlbum(ctx);
@@ -46,9 +54,9 @@ export async function api(ctx: RequestContext): Promise<Response> {
   const familyRelationship = url.pathname.match(/^\/api\/family-tree\/relationships\/([^/]+)$/);
   if (method === "DELETE" && familyRelationship) return deleteFamilyRelationship(ctx, familyRelationship[1]);
 
-  const media = url.pathname.match(/^\/api\/photos\/([^/]+)\/(thumbnail|gallery|viewer|original)$/);
+  const media = url.pathname.match(/^\/api\/photos\/([^/]+)\/(small|thumbnail|gallery|viewer|original)$/);
   if (method === "GET" && media) return servePhoto(ctx, media[1], media[2]);
-  const upload = url.pathname.match(/^\/api\/photos\/([^/]+)\/upload\/(thumbnail|gallery|original)$/);
+  const upload = url.pathname.match(/^\/api\/photos\/([^/]+)\/upload\/(small|thumbnail|gallery|original)$/);
   if (method === "PUT" && upload) return uploadVariant(ctx, upload[1], upload[2]);
   const complete = url.pathname.match(/^\/api\/photos\/([^/]+)\/complete$/);
   if (method === "POST" && complete) return completePhoto(ctx, complete[1]);
@@ -137,10 +145,14 @@ async function register({ request, env }: RequestContext): Promise<Response> {
   if (passwordError) throw new HttpError(400, passwordError);
   const id = uuid();
   try {
-    await env.DB.batch([
-      env.DB.prepare("INSERT INTO users(id,email,display_name,password_hash,role) VALUES(?,?,?,?,?)").bind(id, email, displayName, await hashPassword(password), invitation.role),
-      env.DB.prepare("UPDATE invitations SET used_at=datetime('now') WHERE id=? AND used_at IS NULL").bind(invitation.id)
+    const result = await env.DB.batch([
+      env.DB.prepare(`INSERT INTO users(id,email,display_name,password_hash,role)
+        SELECT ?,?,?,?,role FROM invitations WHERE id=? AND used_at IS NULL AND revoked_at IS NULL
+        AND expires_at > datetime('now') AND (email IS NULL OR lower(email)=?)`)
+        .bind(id,email,displayName,await hashPassword(password),invitation.id,email),
+      env.DB.prepare("UPDATE invitations SET used_at=datetime('now') WHERE id=? AND used_at IS NULL AND EXISTS(SELECT 1 FROM users WHERE id=?)").bind(invitation.id,id)
     ]);
+    if (result[0].meta.changes !== 1) throw new HttpError(409, "Invitation is no longer available.");
   } catch { throw new HttpError(409, "That account already exists or the invitation was used."); }
   await audit(env, id, "member.registered", "user", id);
   return json({ user: { id, email, displayName, role: invitation.role } }, { status: 201, headers: { "Set-Cookie": await createSession(request, env, id) } });
@@ -161,11 +173,14 @@ async function recoverAccount({ request, env }: RequestContext): Promise<Respons
   const recovery = await env.DB.prepare("SELECT id,user_id FROM recovery_tokens WHERE token_hash=? AND used_at IS NULL AND revoked_at IS NULL AND expires_at > datetime('now')")
     .bind(await sha256(token)).first<{ id: string; user_id: string }>();
   if (!recovery) throw new HttpError(400, "Recovery link is invalid or expired.");
-  await env.DB.batch([
-    env.DB.prepare("UPDATE users SET password_hash=?,updated_at=datetime('now') WHERE id=?").bind(await hashPassword(password), recovery.user_id),
-    env.DB.prepare("UPDATE recovery_tokens SET used_at=datetime('now') WHERE id=? AND used_at IS NULL").bind(recovery.id),
-    env.DB.prepare("DELETE FROM sessions WHERE user_id=?").bind(recovery.user_id)
+  const validRecovery = "EXISTS(SELECT 1 FROM recovery_tokens WHERE id=? AND user_id=? AND used_at IS NULL AND revoked_at IS NULL AND expires_at > datetime('now'))";
+  const result = await env.DB.batch([
+    env.DB.prepare(`UPDATE users SET password_hash=?,updated_at=datetime('now') WHERE id=? AND ${validRecovery}`)
+      .bind(await hashPassword(password),recovery.user_id,recovery.id,recovery.user_id),
+    env.DB.prepare(`DELETE FROM sessions WHERE user_id=? AND ${validRecovery}`).bind(recovery.user_id,recovery.id,recovery.user_id),
+    env.DB.prepare("UPDATE recovery_tokens SET used_at=datetime('now') WHERE id=? AND used_at IS NULL AND revoked_at IS NULL AND expires_at > datetime('now')").bind(recovery.id)
   ]);
+  if (result[0].meta.changes !== 1) throw new HttpError(400, "Recovery link is invalid or expired.");
   await audit(env, recovery.user_id, "member.password_recovered", "user", recovery.user_id);
   return json({ ok: true });
 }
@@ -173,28 +188,26 @@ async function recoverAccount({ request, env }: RequestContext): Promise<Respons
 async function dashboard({ env, user }: RequestContext): Promise<Response> {
   requireUser(user);
   const [photos, memories, albums, activity] = await Promise.all([
-    env.DB.prepare(`SELECT p.id,p.caption,p.event_description,p.date_taken,p.created_at,p.owner_id,u.display_name uploader FROM photos p JOIN users u ON u.id=p.owner_id WHERE p.status='ready' AND ${photoAccessSql("p")} ORDER BY p.created_at DESC LIMIT 8`).bind(user!.id, user!.role).all(),
-    env.DB.prepare(`SELECT p.id,p.caption,p.event_description,p.date_taken,p.created_at,p.owner_id,u.display_name uploader,
-      CASE
-        WHEN p.date_taken IS NOT NULL AND substr(p.date_taken,6,5)=strftime('%m-%d','now') THEN 'on_this_day'
-        WHEN p.date_taken IS NOT NULL AND substr(p.date_taken,6,2)=strftime('%m','now') THEN 'this_month'
-        ELSE 'recent'
-      END memory_reason
-      FROM photos p JOIN users u ON u.id=p.owner_id
-      WHERE p.status='ready' AND ${photoAccessSql("p")}
-      ORDER BY CASE
-        WHEN p.date_taken IS NOT NULL AND substr(p.date_taken,6,5)=strftime('%m-%d','now') THEN 0
-        WHEN p.date_taken IS NOT NULL AND substr(p.date_taken,6,2)=strftime('%m','now') THEN 1
-        ELSE 2
-      END, COALESCE(p.date_taken,p.created_at) DESC, p.created_at DESC LIMIT 10`).bind(user!.id, user!.role).all(),
-    env.DB.prepare("SELECT a.id,a.name,a.description,a.cover_photo_id,COUNT(ap.photo_id) photo_count,a.created_at FROM albums a LEFT JOIN album_photos ap ON ap.album_id=a.id WHERE a.visibility='family' OR a.owner_id=? GROUP BY a.id ORDER BY a.created_at DESC LIMIT 5").bind(user!.id).all(),
+    env.DB.prepare(`SELECT p.id,p.caption,p.event_description,p.date_taken,p.created_at,p.owner_id,p.width,p.height,u.display_name uploader FROM photos p JOIN users u ON u.id=p.owner_id WHERE p.status='ready' AND ${photoAccessSql("p")} ORDER BY p.created_at DESC LIMIT 8`).bind(user!.id, user!.role).all(),
+    env.DB.batch<Record<string,unknown>>([
+      {reason:"on_this_day",where:"substr(p.date_taken,6,5)=strftime('%m-%d','now')",order:"p.date_taken DESC"},
+      {reason:"this_month",where:"substr(p.date_taken,6,2)=strftime('%m','now')",order:"p.date_taken DESC"},
+      {reason:"recent",where:"1",order:"COALESCE(p.date_taken,p.created_at) DESC,p.created_at DESC"},
+    ].map(group=>env.DB.prepare(`SELECT p.id,p.caption,p.event_description,p.date_taken,p.created_at,p.owner_id,p.width,p.height,u.display_name uploader,'${group.reason}' memory_reason
+      FROM photos p JOIN users u ON u.id=p.owner_id WHERE p.status='ready' AND ${group.where} AND ${photoAccessSql("p")} ORDER BY ${group.order} LIMIT 10`).bind(user!.id,user!.role)))
+      .then(pages=>({results:pages.flatMap(page=>page.results).filter((row,index,all)=>all.findIndex(other=>other.id===row.id)===index).slice(0,10)})),
+    env.DB.prepare(`SELECT a.id,a.name,a.description,a.cover_photo_id,${albumThumbnailSql()},COUNT(ap.photo_id) photo_count,a.created_at FROM albums a LEFT JOIN album_photos ap ON ap.album_id=a.id WHERE a.visibility='family' OR a.owner_id=? GROUP BY a.id ORDER BY a.created_at DESC LIMIT 5`).bind(user!.id).all(),
     env.DB.prepare("SELECT action,target_type,created_at FROM audit_logs ORDER BY created_at DESC LIMIT 8").all()
   ]);
   return json({ photos: photos.results, memories: memories.results, albums: albums.results, activity: activity.results });
 }
 
+function albumThumbnailSql(): string {
+  return `COALESCE((SELECT cp.id FROM album_photos cap JOIN photos cp ON cp.id=cap.photo_id WHERE cap.album_id=a.id AND cp.id=a.cover_photo_id AND cp.status='ready' LIMIT 1),(SELECT cp.id FROM album_photos cap JOIN photos cp ON cp.id=cap.photo_id WHERE cap.album_id=a.id AND cp.status='ready' ORDER BY cp.created_at DESC,cp.id DESC LIMIT 1)) thumbnail_photo_id`;
+}
+
 async function listAlbums({ env, user }: RequestContext): Promise<Response> {
-  const rows = await env.DB.prepare(`SELECT a.id,a.name,a.description,a.visibility,a.owner_id,a.cover_photo_id,a.created_at,u.display_name creator,COUNT(ap.photo_id) photo_count
+  const rows = await env.DB.prepare(`SELECT a.id,a.name,a.description,a.visibility,a.owner_id,a.cover_photo_id,${albumThumbnailSql()},a.created_at,u.display_name creator,COUNT(ap.photo_id) photo_count
     FROM albums a JOIN users u ON u.id=a.owner_id LEFT JOIN album_photos ap ON ap.album_id=a.id
     WHERE a.visibility='family' OR a.owner_id=? OR ?='admin' GROUP BY a.id ORDER BY a.updated_at DESC`).bind(user!.id, user!.role).all();
   return json({ albums: rows.results });
@@ -282,14 +295,15 @@ async function deleteFamilyRelationship({ env, user }: RequestContext, id: strin
   return json({ ok: true });
 }
 
-async function listPersonPhotos({ env, user }: RequestContext, personId: string): Promise<Response> {
+async function listPersonPhotos({ env, url, user }: RequestContext, personId: string): Promise<Response> {
   const exists = await env.DB.prepare("SELECT id FROM family_people WHERE id=?").bind(personId).first();
   if (!exists) throw new HttpError(404, "Relative not found.");
+  const offset=collectionOffset(url);
   const photos = await env.DB.prepare(`SELECT p.id,p.caption,p.event_description,p.date_taken,p.created_at,p.owner_id,p.width,p.height,u.display_name uploader
     FROM photo_people pp JOIN photos p ON p.id=pp.photo_id JOIN users u ON u.id=p.owner_id
     WHERE pp.person_id=? AND p.status='ready' AND ${photoAccessSql("p")}
-    ORDER BY COALESCE(p.date_taken,p.created_at) DESC LIMIT 80`).bind(personId, user!.id, user!.role).all();
-  return json({ photos: photos.results });
+    ORDER BY COALESCE(p.date_taken,p.created_at) DESC,p.id DESC LIMIT 101 OFFSET ?`).bind(personId, user!.id, user!.role,offset).all();
+  return json(collectionPage(photos.results,offset));
 }
 
 async function listPhotoPeople({ env, user }: RequestContext, photoId: string): Promise<Response> {
@@ -375,14 +389,64 @@ async function deleteAlbum({ env, user }: RequestContext, id: string): Promise<R
 }
 
 async function listPhotos({ env, url, user }: RequestContext): Promise<Response> {
-  const limit = Math.min(60, Math.max(1, Number(url.searchParams.get("limit") || 30)));
-  const cursor = url.searchParams.get("cursor") || "9999-12-31T23:59:59.999Z";
-  const albumId = url.searchParams.get("album");
-  const rows = albumId
-    ? await env.DB.prepare(`SELECT p.id,p.caption,p.event_description,p.date_taken,p.created_at,p.owner_id,p.width,p.height,u.display_name uploader FROM photos p JOIN users u ON u.id=p.owner_id JOIN album_photos ap ON ap.photo_id=p.id JOIN albums a ON a.id=ap.album_id WHERE p.status='ready' AND ap.album_id=? AND p.created_at<? AND (a.visibility='family' OR a.owner_id=? OR ?='admin') ORDER BY p.created_at DESC LIMIT ?`).bind(albumId, cursor, user!.id, user!.role, limit + 1).all()
-    : await env.DB.prepare(`SELECT p.id,p.caption,p.event_description,p.date_taken,p.created_at,p.owner_id,p.width,p.height,u.display_name uploader FROM photos p JOIN users u ON u.id=p.owner_id WHERE p.status='ready' AND p.created_at<? AND ${photoAccessSql("p")} ORDER BY p.created_at DESC LIMIT ?`).bind(cursor, user!.id, user!.role, limit + 1).all();
-  const items = rows.results.slice(0, limit) as Array<Record<string, unknown>>;
-  return json({ photos: items, nextCursor: rows.results.length > limit ? items[items.length - 1]?.created_at : null });
+  const query = photoQuery(url, user!, photoAccessSql("p"));
+  const countUrl = new URL(url); countUrl.searchParams.delete("cursor");
+  const count = photoQuery(countUrl,user!,photoAccessSql("p"));
+  const [rows,totalRows] = await env.DB.batch<Record<string,unknown>>([
+    env.DB.prepare(`SELECT p.id,p.caption,p.event_description,p.date_taken,p.created_at,p.owner_id,p.width,p.height,u.display_name uploader FROM photos p JOIN users u ON u.id=p.owner_id WHERE ${query.where} ORDER BY ${query.order} LIMIT ?`).bind(...query.bindings,query.limit+1),
+    env.DB.prepare(`SELECT COUNT(*) total FROM photos p WHERE ${count.where}`).bind(...count.bindings),
+  ]);
+  const items = rows.results.slice(0, query.limit);
+  const last = items[items.length - 1];
+  return json({ photos: items, total:Number(totalRows.results[0]?.total || 0), nextCursor: rows.results.length > query.limit && last ? JSON.stringify([query.taken ? last.date_taken || "" : last.created_at, last.id]) : null });
+}
+
+function selectedPhotoIds(body: Body): string[] {
+  if (!Array.isArray(body.photoIds) || body.photoIds.length < 1 || body.photoIds.length > 60 || body.photoIds.some((id) => typeof id !== "string" || !id || id.length > 64)) throw new HttpError(400, "Select between 1 and 60 photographs.");
+  return [...new Set(body.photoIds as string[])];
+}
+
+async function listMemories({ env, user }: RequestContext): Promise<Response> {
+  // A private photo's membership must not expose its group's title or story.
+  const rows = await env.DB.prepare(`SELECT m.*,COUNT(p.id) photo_count FROM memories m JOIN memory_photos mp ON mp.memory_id=m.id JOIN photos p ON p.id=mp.photo_id WHERE p.status='ready' AND ${photoAccessSql("p")} GROUP BY m.id ORDER BY COALESCE(m.event_date,m.created_at) DESC,m.id DESC`).bind(user!.id, user!.role).all();
+  return json({ memories: rows.results });
+}
+
+async function createMemory({ request, env, user }: RequestContext): Promise<Response> {
+  const body = await readJson<Body>(request);
+  const ids = selectedPhotoIds(body);
+  const title = cleanText(body.title, 160);
+  if (!title) throw new HttpError(400, "Give this memory a title.");
+  // Shared group descriptions require access to every included photo.
+  const visible = await env.DB.prepare(`SELECT p.id FROM photos p WHERE p.status='ready' AND p.id IN (${ids.map(() => "?").join(",")}) AND ${photoAccessSql("p")}`).bind(...ids,user!.id,user!.role).all();
+  if (visible.results.length !== ids.length) throw new HttpError(404,"Photo not found.");
+  const id = uuid();
+  await env.DB.batch([
+    env.DB.prepare("INSERT INTO memories(id,title,story,event_date,created_by) VALUES(?,?,?,?,?)").bind(id,title,cleanText(body.story,2000),nullableDate(body.eventDate),user!.id),
+    ...ids.map((photoId) => env.DB.prepare("INSERT INTO memory_photos(memory_id,photo_id) VALUES(?,?)").bind(id,photoId)),
+  ]);
+  await audit(env,user!.id,"memory.created","memory",id);
+  return json({ id }, { status: 201 });
+}
+
+async function bulkEditPhotos({ request, env, user }: RequestContext): Promise<Response> {
+  const body = await readJson<Body>(request);
+  const ids = selectedPhotoIds(body);
+  const columns: string[] = [];
+  const values: (string | null)[] = [];
+  if ("caption" in body) { columns.push("caption=?"); values.push(cleanText(body.caption,500)); }
+  if ("eventDescription" in body) { columns.push("event_description=?"); values.push(cleanText(body.eventDescription,500)); }
+  if ("dateTaken" in body) {
+    const date = nullableDate(body.dateTaken);
+    if (body.dateTaken && !date) throw new HttpError(400,"Choose a valid date.");
+    columns.push("date_taken=?"); values.push(date);
+  }
+  if (!columns.length) throw new HttpError(400,"Choose details to change.");
+  // Check the entire selection before changing any records.
+  const owned = await env.DB.prepare(`SELECT id FROM photos WHERE status='ready' AND id IN (${ids.map(() => "?").join(",")}) AND (owner_id=? OR ?='admin')`).bind(...ids,user!.id,user!.role).all();
+  if (owned.results.length !== ids.length) throw new HttpError(404,"Photo not found.");
+  await env.DB.batch(ids.map((id) => env.DB.prepare(`UPDATE photos SET ${columns.join(",")},updated_at=datetime('now') WHERE id=?`).bind(...values,id)));
+  return json({ ok:true });
 }
 
 async function initPhoto({ request, env, user }: RequestContext): Promise<Response> {
@@ -393,13 +457,14 @@ async function initPhoto({ request, env, user }: RequestContext): Promise<Respon
   const originalBytes = positiveInt(body.originalBytes);
   const galleryBytes = positiveInt(body.galleryBytes);
   const thumbnailBytes = positiveInt(body.thumbnailBytes);
+  const smallBytes = positiveInt(body.smallBytes);
   if (!PHOTO_TYPES.has(mimeType)) throw new HttpError(415, "Only JPEG, PNG, and WebP photos are supported.");
   if (!originalFilename || !galleryBytes || !thumbnailBytes) throw new HttpError(400, "Photo metadata is incomplete.");
   const config = await settingsMap(env);
   const preserve = config.preserve_originals === "true";
   const maxBytes = Number(config.max_upload_bytes || 20 * 1024 * 1024);
-  if (Math.max(originalBytes, galleryBytes, thumbnailBytes) > maxBytes) throw new HttpError(413, "Photo exceeds the configured upload limit.");
-  const incoming = galleryBytes + thumbnailBytes + (preserve ? originalBytes : 0);
+  if (Math.max(originalBytes, galleryBytes, thumbnailBytes, smallBytes) > maxBytes) throw new HttpError(413, "Photo exceeds the configured upload limit.");
+  const incoming = galleryBytes + thumbnailBytes + smallBytes + (preserve ? originalBytes : 0);
   const quota = Number(config.storage_quota_bytes);
   const hash = cleanText(body.hash, 128) || null;
   if (hash) {
@@ -408,27 +473,23 @@ async function initPhoto({ request, env, user }: RequestContext): Promise<Respon
   }
   const id = uuid();
   const base = `photos/${id}`;
+  const values = [id,user!.id,cleanText(body.caption,500),cleanText(body.eventDescription,500),originalFilename,mimeType,
+    nullableDate(body.dateTaken),positiveInt(body.width)||null,positiveInt(body.height)||null,hash,
+    preserve ? `${base}/original` : null,`${base}/gallery`,`${base}/thumbnail`,smallBytes ? `${base}/small` : null,
+    preserve ? originalBytes : 0,galleryBytes,thumbnailBytes,smallBytes];
   const reservation = await env.DB.prepare(`INSERT INTO photos(
-      id,owner_id,caption,event_description,original_filename,mime_type,date_taken,width,height,hash,
-      original_key,gallery_key,thumbnail_key,expected_original_bytes,expected_gallery_bytes,expected_thumbnail_bytes,upload_expires_at
-    )
-    SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','+1 hour')
-    WHERE COALESCE((SELECT SUM(
-      CASE WHEN status='ready' THEN original_bytes+gallery_bytes+thumbnail_bytes
-           WHEN status='pending' AND upload_expires_at > datetime('now') THEN expected_original_bytes+expected_gallery_bytes+expected_thumbnail_bytes
-           ELSE 0 END
-    ) FROM photos),0) + ? <= ?`).bind(
-      id, user!.id, cleanText(body.caption, 500), cleanText(body.eventDescription, 500), originalFilename, mimeType,
-      nullableDate(body.dateTaken), positiveInt(body.width) || null, positiveInt(body.height) || null, hash,
-      preserve ? `${base}/original` : null, `${base}/gallery`, `${base}/thumbnail`, preserve ? originalBytes : 0,
-      galleryBytes, thumbnailBytes, incoming, quota
-    ).run();
+    id,owner_id,caption,event_description,original_filename,mime_type,date_taken,width,height,hash,
+    original_key,gallery_key,thumbnail_key,small_key,expected_original_bytes,expected_gallery_bytes,expected_thumbnail_bytes,expected_small_bytes,upload_expires_at
+  ) SELECT ${values.map(()=>"?").join(",")},datetime('now','+1 hour')
+    WHERE COALESCE((SELECT SUM(CASE WHEN status='ready' THEN original_bytes+gallery_bytes+thumbnail_bytes+small_bytes
+      WHEN status='pending' AND upload_expires_at > datetime('now') THEN expected_original_bytes+expected_gallery_bytes+expected_thumbnail_bytes+expected_small_bytes ELSE 0 END) FROM photos),0)+?<=?`)
+    .bind(...values,incoming,quota).run();
   if (!reservation.meta.changes) throw new HttpError(413, "The family storage quota would be exceeded.");
-  return json({ id, preserveOriginal: preserve, upload: { gallery: `/api/photos/${id}/upload/gallery`, thumbnail: `/api/photos/${id}/upload/thumbnail`, original: preserve ? `/api/photos/${id}/upload/original` : null } }, { status: 201 });
+  return json({ id, preserveOriginal: preserve, upload: { small:smallBytes ? `/api/photos/${id}/upload/small` : null, gallery: `/api/photos/${id}/upload/gallery`, thumbnail: `/api/photos/${id}/upload/thumbnail`, original: preserve ? `/api/photos/${id}/upload/original` : null } }, { status: 201 });
 }
 
 async function uploadVariant({ request, env, user }: RequestContext, id: string, variant: string): Promise<Response> {
-  const photo = await env.DB.prepare("SELECT owner_id,status,original_key,gallery_key,thumbnail_key,expected_original_bytes,expected_gallery_bytes,expected_thumbnail_bytes FROM photos WHERE id=? AND upload_expires_at > datetime('now')").bind(id).first<Record<string, string | null>>();
+  const photo = await env.DB.prepare("SELECT owner_id,status,original_key,gallery_key,thumbnail_key,small_key,expected_original_bytes,expected_gallery_bytes,expected_thumbnail_bytes,expected_small_bytes FROM photos WHERE id=? AND upload_expires_at > datetime('now')").bind(id).first<Record<string, string | null>>();
   if (!photo || photo.status !== "pending" || (photo.owner_id !== user!.id && user!.role !== "admin")) throw new HttpError(404, "Pending upload not found or has expired.");
   const key = photo[`${variant}_key`];
   if (!key) throw new HttpError(400, "This image variant is disabled.");
@@ -443,39 +504,62 @@ async function uploadVariant({ request, env, user }: RequestContext, id: string,
 }
 
 async function completePhoto({ env, user }: RequestContext, id: string): Promise<Response> {
-  const photo = await env.DB.prepare("SELECT owner_id,status,original_key,gallery_key,thumbnail_key,expected_original_bytes,expected_gallery_bytes,expected_thumbnail_bytes FROM photos WHERE id=? AND upload_expires_at > datetime('now')").bind(id).first<Record<string, string | null>>();
+  const photo = await env.DB.prepare("SELECT owner_id,status,original_key,gallery_key,thumbnail_key,small_key,expected_original_bytes,expected_gallery_bytes,expected_thumbnail_bytes,expected_small_bytes FROM photos WHERE id=? AND upload_expires_at > datetime('now')").bind(id).first<Record<string, string | null>>();
   if (!photo || photo.status !== "pending" || (photo.owner_id !== user!.id && user!.role !== "admin")) throw new HttpError(404, "Pending upload not found or has expired.");
-  const [original, gallery, thumbnail] = await Promise.all([photo.original_key ? env.PHOTOS.head(photo.original_key) : null, env.PHOTOS.head(photo.gallery_key!), env.PHOTOS.head(photo.thumbnail_key!)]);
-  if (!gallery || !thumbnail || (photo.original_key && !original)) throw new HttpError(409, "Upload is not complete yet.");
+  const [original, gallery, thumbnail, small] = await Promise.all([photo.original_key ? env.PHOTOS.head(photo.original_key) : null, env.PHOTOS.head(photo.gallery_key!), env.PHOTOS.head(photo.thumbnail_key!),photo.small_key ? env.PHOTOS.head(photo.small_key) : null]);
+  if (!gallery || !thumbnail || (photo.original_key && !original) || (photo.small_key && !small)) throw new HttpError(409, "Upload is not complete yet.");
   const sizesMatch = gallery.size === Number(photo.expected_gallery_bytes)
     && thumbnail.size === Number(photo.expected_thumbnail_bytes)
+    && (!photo.small_key || small?.size === Number(photo.expected_small_bytes))
     && (!photo.original_key || original?.size === Number(photo.expected_original_bytes));
   if (!sizesMatch) {
-    await Promise.all([photo.original_key, photo.gallery_key, photo.thumbnail_key].filter(Boolean).map((key) => env.PHOTOS.delete(key!)));
+    await Promise.all([photo.original_key, photo.gallery_key, photo.thumbnail_key,photo.small_key].filter(Boolean).map((key) => env.PHOTOS.delete(key!)));
     await env.DB.prepare("DELETE FROM photos WHERE id=? AND status='pending'").bind(id).run();
     throw new HttpError(413, "Uploaded files did not match their reserved sizes. Please retry.");
   }
-  await env.DB.prepare("UPDATE photos SET status='ready',original_bytes=?,gallery_bytes=?,thumbnail_bytes=?,upload_expires_at=NULL,updated_at=datetime('now') WHERE id=?")
-    .bind(original?.size || 0, gallery.size, thumbnail.size, id).run();
+  await env.DB.prepare("UPDATE photos SET status='ready',original_bytes=?,gallery_bytes=?,thumbnail_bytes=?,small_bytes=?,upload_expires_at=NULL,updated_at=datetime('now') WHERE id=?")
+    .bind(original?.size || 0, gallery.size, thumbnail.size,small?.size || 0, id).run();
   await audit(env, user!.id, "photo.uploaded", "photo", id);
   return json({ id, ok: true });
 }
 
-async function servePhoto({ env, user }: RequestContext, id: string, variant: string): Promise<Response> {
+export async function serveAuthenticatedPhoto(request:Request,env:Env,id:string,variant:string):Promise<Response> {
+  const started=performance.now(),hash=await sessionTokenHash(request);
+  if(!hash)throw new HttpError(401,"Please sign in.");
+  const photo=await env.DB.prepare(`SELECT u.id session_user_id,p.id photo_id,p.original_filename,p.mime_type,p.original_key,p.gallery_key,p.thumbnail_key,p.small_key
+    FROM sessions s JOIN users u ON u.id=s.user_id
+    LEFT JOIN photos p ON p.id=? AND p.status='ready' AND ${photoAccessPredicate("p","u.id","u.role")}
+    WHERE s.id_hash=? AND julianday(s.expires_at)>julianday('now') AND u.status='active'`).bind(id,hash).first<Record<string,string|null>>();
+  if(!photo)throw new HttpError(401,"Please sign in.");
+  if(!photo.photo_id)throw new HttpError(404,"Photo not found.");
+  const authorized=performance.now();const response=await deliverPhoto(request,env,photo,variant);
+  response.headers.set("Server-Timing",`auth;dur=${(authorized-started).toFixed(1)}, storage;dur=${(performance.now()-authorized).toFixed(1)}`);
+  return response;
+}
+
+async function servePhoto({ request, env, user }: RequestContext, id: string, variant: string): Promise<Response> {
   requireUser(user);
-  const photo = await env.DB.prepare(`SELECT p.original_filename,p.mime_type,p.original_key,p.gallery_key,p.thumbnail_key FROM photos p WHERE p.id=? AND p.status='ready' AND ${photoAccessSql("p")}`).bind(id, user!.id, user!.role).first<Record<string, string | null>>();
+  const photo = await env.DB.prepare(`SELECT p.original_filename,p.mime_type,p.original_key,p.gallery_key,p.thumbnail_key,p.small_key FROM photos p WHERE p.id=? AND p.status='ready' AND ${photoAccessSql("p")}`).bind(id, user!.id, user!.role).first<Record<string, string | null>>();
   if (!photo) throw new HttpError(404, "Photo not found.");
+  return deliverPhoto(request,env,photo,variant);
+}
+
+async function deliverPhoto(request:Request,env:Env,photo:Record<string,string|null>,variant:string):Promise<Response> {
   // The viewer should show the complete photograph. Prefer the untouched
   // original when it is retained, while keeping gallery derivatives as a
   // fallback for vaults configured not to preserve originals.
   const key = variant === "viewer"
     ? photo.original_key || photo.gallery_key
-    : photo[`${variant}_key`] || photo.gallery_key;
+    : variant === "small" ? photo.small_key || photo.thumbnail_key || photo.gallery_key : photo[`${variant}_key`] || photo.gallery_key;
+  if (variant !== "original" && request.headers.has("If-None-Match")) {
+    const metadata = await env.PHOTOS.head(key!);
+    if (metadata && matchesMediaTag(request,metadata.httpEtag)) return new Response(null,{ status:304,headers:{ ...mediaCacheHeaders(false),ETag:metadata.httpEtag } });
+  }
   const object = await env.PHOTOS.get(key!);
   if (!object) throw new HttpError(404, "Photo file not found.");
   const headers = new Headers();
   object.writeHttpMetadata(headers);
-  headers.set("Cache-Control", "private, no-store, max-age=0");
+  for (const [name,value] of Object.entries(mediaCacheHeaders(variant === "original"))) headers.set(name,value);
   headers.set("Content-Security-Policy", "default-src 'none'");
   headers.set("Content-Disposition", variant === "original" ? `attachment; filename="${safeFilename(photo.original_filename || "photo")}"` : "inline");
   headers.set("ETag", object.httpEtag);
@@ -492,7 +576,7 @@ async function updatePhoto({ request, env, user }: RequestContext, id: string): 
 
 async function deletePhoto({ env, user }: RequestContext, id: string): Promise<Response> {
   await requirePhotoOwner(env, user!, id);
-  const photo = await env.DB.prepare("SELECT original_key,gallery_key,thumbnail_key FROM photos WHERE id=?").bind(id).first<Record<string, string | null>>();
+  const photo = await env.DB.prepare("SELECT original_key,gallery_key,thumbnail_key,small_key FROM photos WHERE id=?").bind(id).first<Record<string, string | null>>();
   if (!photo) throw new HttpError(404, "Photo not found.");
   await env.DB.prepare("UPDATE photos SET status='deleting' WHERE id=?").bind(id).run();
   await Promise.all(Object.values(photo).filter(Boolean).map((key) => env.PHOTOS.delete(key!)));
@@ -560,23 +644,24 @@ async function toggleReaction({ request, env, user }: RequestContext, photoId: s
 }
 
 async function timeline({ env, url, user }: RequestContext): Promise<Response> {
+  const offset=collectionOffset(url);
   const year = /^\d{4}$/.test(url.searchParams.get("year") || "") ? url.searchParams.get("year")! : "";
   const month = /^(?:0[1-9]|1[0-2])$/.test(url.searchParams.get("month") || "") ? url.searchParams.get("month")! : "";
   const album = cleanText(url.searchParams.get("album"), 64);
   const event = cleanText(url.searchParams.get("event"), 80);
   const clauses = ["p.status='ready'"];
   const bindings: string[] = [];
-  if (year) { clauses.push("substr(p.date_taken,1,4)=?"); bindings.push(year); }
+  if (year) { clauses.push("p.date_taken>=? AND p.date_taken<?"); bindings.push(`${year}-01-01`,`${Number(year)+1}-01-01`); }
   if (month) { clauses.push("substr(p.date_taken,6,2)=?"); bindings.push(month); }
   if (album) { clauses.push("EXISTS (SELECT 1 FROM album_photos timeline_ap WHERE timeline_ap.photo_id=p.id AND timeline_ap.album_id=?)"); bindings.push(album); }
   if (event) { clauses.push("(p.event_description LIKE ? OR p.caption LIKE ?)"); const pattern = `%${event.replace(/[%_]/g, "")}%`; bindings.push(pattern, pattern); }
   clauses.push(photoAccessSql("p"));
   bindings.push(user!.id, user!.role);
-  const rows = await env.DB.prepare(`SELECT p.id,p.caption,p.event_description,p.date_taken,p.created_at,p.owner_id,u.display_name uploader
+  const rows = await env.DB.prepare(`SELECT p.id,p.caption,p.event_description,p.date_taken,p.created_at,p.owner_id,p.width,p.height,u.display_name uploader
     FROM photos p JOIN users u ON u.id=p.owner_id
     WHERE ${clauses.join(" AND ")}
-    ORDER BY CASE WHEN p.date_taken IS NULL THEN 1 ELSE 0 END, p.date_taken DESC, p.created_at DESC LIMIT 120`).bind(...bindings).all();
-  return json({ photos: rows.results });
+    ORDER BY CASE WHEN p.date_taken IS NULL THEN 1 ELSE 0 END, p.date_taken DESC, p.created_at DESC,p.id DESC LIMIT 101 OFFSET ?`).bind(...bindings,offset).all();
+  return json(collectionPage(rows.results,offset));
 }
 
 async function search({ env, url, user }: RequestContext): Promise<Response> {
@@ -587,24 +672,33 @@ async function search({ env, url, user }: RequestContext): Promise<Response> {
   let dateClause = "0";
   const dateBindings: string[] = [];
   if (year && month) {
-    dateClause = "(substr(p.date_taken,1,7)=? OR substr(p.created_at,1,7)=?)";
-    dateBindings.push(`${year}-${month}`, `${year}-${month}`);
+    dateClause = "((p.date_taken>=? AND p.date_taken<?) OR (p.created_at>=? AND p.created_at<?))";
+    const start=`${year}-${month}-01`,end=month==="12" ? `${Number(year)+1}-01-01` : `${year}-${String(Number(month)+1).padStart(2,"0")}-01`;
+    dateBindings.push(start,end,start,end);
   } else if (year) {
-    dateClause = "(substr(p.date_taken,1,4)=? OR substr(p.created_at,1,4)=?)";
-    dateBindings.push(year, year);
+    dateClause = "((p.date_taken>=? AND p.date_taken<?) OR (p.created_at>=? AND p.created_at<?))";
+    dateBindings.push(`${year}-01-01`,`${Number(year)+1}-01-01`,`${year}-01-01`,`${Number(year)+1}-01-01`);
   } else if (month) {
     dateClause = "(substr(p.date_taken,6,2)=? OR substr(p.created_at,6,2)=?)";
     dateBindings.push(month, month);
   }
-  const [photos, albums] = await Promise.all([
-    env.DB.prepare(`SELECT p.id,p.caption,p.event_description,p.date_taken,p.created_at,p.owner_id,u.display_name uploader FROM photos p JOIN users u ON u.id=p.owner_id WHERE p.status='ready' AND (p.caption LIKE ? OR p.event_description LIKE ? OR u.display_name LIKE ? OR ${dateClause}) AND ${photoAccessSql("p")} ORDER BY p.created_at DESC LIMIT 40`).bind(pattern, pattern, pattern, ...dateBindings, user!.id, user!.role).all(),
-    env.DB.prepare(`SELECT a.id,a.name,a.description,a.visibility,a.owner_id,a.cover_photo_id,u.display_name creator,
-      (SELECT COUNT(*) FROM album_photos ap WHERE ap.album_id=a.id) photo_count
-      FROM albums a JOIN users u ON u.id=a.owner_id
-      WHERE (a.visibility='family' OR a.owner_id=? OR ?='admin') AND (a.name LIKE ? OR a.description LIKE ?)
-      ORDER BY a.updated_at DESC LIMIT 20`).bind(user!.id, user!.role, pattern, pattern).all()
+  const offset=collectionOffset(url);
+  const photoFrom=`FROM photos p JOIN users u ON u.id=p.owner_id WHERE p.status='ready' AND p.rowid IN (
+    SELECT rowid FROM photo_search WHERE caption LIKE ? UNION SELECT rowid FROM photo_search WHERE event_description LIKE ?
+    UNION SELECT rowid FROM photos WHERE owner_id IN (SELECT id FROM users WHERE display_name LIKE ?)
+    UNION SELECT p.rowid FROM photos p WHERE p.status='ready' AND ${dateClause}
+  ) AND ${photoAccessSql("p")}`;
+  const albumFrom=`FROM albums a JOIN users u ON u.id=a.owner_id WHERE (a.visibility='family' OR a.owner_id=? OR ?='admin') AND (a.name LIKE ? OR a.description LIKE ?)`;
+  const photoBindings=[pattern,pattern,pattern,...dateBindings,user!.id,user!.role];
+  const albumBindings=[user!.id,user!.role,pattern,pattern];
+  const [photos,albums,photoTotal,albumTotal]=await Promise.all([
+    env.DB.prepare(`SELECT p.id,p.caption,p.event_description,p.date_taken,p.created_at,p.owner_id,p.width,p.height,u.display_name uploader ${photoFrom} ORDER BY p.created_at DESC,p.id DESC LIMIT 101 OFFSET ?`).bind(...photoBindings,offset*100).all(),
+    env.DB.prepare(`SELECT a.id,a.name,a.description,a.visibility,a.owner_id,a.cover_photo_id,${albumThumbnailSql()},u.display_name creator,(SELECT COUNT(*) FROM album_photos ap WHERE ap.album_id=a.id) photo_count ${albumFrom} ORDER BY a.updated_at DESC,a.id DESC LIMIT 21 OFFSET ?`).bind(...albumBindings,offset*20).all(),
+    env.DB.prepare(`SELECT COUNT(*) total ${photoFrom}`).bind(...photoBindings).first<{total:number}>(),
+    env.DB.prepare(`SELECT COUNT(*) total ${albumFrom}`).bind(...albumBindings).first<{total:number}>()
   ]);
-  return json({ photos: photos.results, albums: albums.results });
+  return json({photos:photos.results.slice(0,100),albums:albums.results.slice(0,20),total:Number(photoTotal?.total || 0)+Number(albumTotal?.total || 0),nextCursor:photos.results.length>100 || albums.results.length>20 ? String(offset+1) : null});
+
 }
 
 function searchDateParts(query: string): { year: string; month: string } {
@@ -675,7 +769,7 @@ async function updateMember({ request, env, user }: RequestContext, id: string):
 
 async function storage({ env, url }: RequestContext): Promise<Response> {
   const config = await settingsMap(env);
-  const row = await env.DB.prepare("SELECT COUNT(*) photo_count,COALESCE(SUM(original_bytes+gallery_bytes+thumbnail_bytes),0) total_bytes FROM photos WHERE status='ready'").first();
+  const row = await env.DB.prepare("SELECT COUNT(*) photo_count,COALESCE(SUM(original_bytes+gallery_bytes+thumbnail_bytes+small_bytes),0) total_bytes FROM photos WHERE status='ready'").first();
   return json({ ...(row || {}), quota_bytes: Number(config.storage_quota_bytes), warning_percent: Number(config.storage_warning_percent), estimated_monthly_usd: Math.max(0, (Number((row as Record<string, number>)?.total_bytes || 0) / 1_000_000_000 - 10) * 0.015), can_seed_samples: env.APP_ENV === "development" && ["localhost", "127.0.0.1"].includes(url.hostname) });
 }
 
@@ -760,45 +854,54 @@ async function exportArchive({ env }: RequestContext): Promise<Response> {
   const metadata = await collectArchiveMetadata(env);
   const photos = metadata.photos as Array<Record<string, string | number | null>>;
   const metadataBytes = new TextEncoder().encode(JSON.stringify(metadata, null, 2));
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
+  async function* chunks(): AsyncGenerator<Uint8Array> {
+    yield tarHeader("family-vault-metadata.json",metadataBytes.byteLength,Date.now());
+    yield metadataBytes;
+    if (metadataBytes.byteLength % 512) yield new Uint8Array(512-metadataBytes.byteLength % 512);
+    for (const photo of photos) {
+      const key = String(photo.original_key || photo.gallery_key || "");
+      if (!key) continue;
+      const object = await env.PHOTOS.get(key);
+      if (!object?.body) continue;
+      const original = Boolean(photo.original_key);
+      const sourceName = original ? safeFilename(String(photo.original_filename || "photo")) : `${safeFilename(String(photo.original_filename || "photo")).replace(/\.[^.]+$/, "")}-optimized.webp`;
+      const archiveName = `photos/${String(photo.id).slice(0,36)}-${sourceName}`.slice(0,99);
+      yield tarHeader(archiveName,object.size,Date.parse(String(photo.created_at || "")) || Date.now());
+      const reader = object.body.getReader();
       try {
-        controller.enqueue(tarHeader("family-vault-metadata.json", metadataBytes.byteLength, Date.now()));
-        controller.enqueue(metadataBytes);
-        enqueueTarPadding(controller, metadataBytes.byteLength);
-        for (const photo of photos) {
-          const key = String(photo.original_key || photo.gallery_key || "");
-          if (!key) continue;
-          const object = await env.PHOTOS.get(key);
-          if (!object?.body) continue;
-          const original = Boolean(photo.original_key);
-          const sourceName = original ? safeFilename(String(photo.original_filename || "photo")) : `${safeFilename(String(photo.original_filename || "photo")).replace(/\.[^.]+$/, "")}-optimized.webp`;
-          const archiveName = `photos/${String(photo.id).slice(0, 36)}-${sourceName}`.slice(0, 99);
-          controller.enqueue(tarHeader(archiveName, object.size, Date.parse(String(photo.created_at || "")) || Date.now()));
-          const reader = object.body.getReader();
-          while (true) {
-            const chunk = await reader.read();
-            if (chunk.done) break;
-            controller.enqueue(chunk.value);
-          }
-          enqueueTarPadding(controller, object.size);
+        while (true) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          yield chunk.value;
         }
-        controller.enqueue(new Uint8Array(1024));
-        controller.close();
-      } catch (error) { controller.error(error); }
+      } finally { await reader.cancel().catch(()=>undefined);reader.releaseLock(); }
+      if (object.size % 512) yield new Uint8Array(512-object.size % 512);
     }
-  });
+    yield new Uint8Array(1024);
+  }
+  const iterator=chunks();
+  const stream = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try { const chunk=await iterator.next();if(chunk.done)controller.close();else controller.enqueue(chunk.value); }
+      catch(error) {controller.error(error);}
+    },
+    async cancel() {await iterator.return(undefined);}
+  },{highWaterMark:0});
   const date = new Date().toISOString().slice(0, 10);
   return new Response(stream, { headers: { "Content-Type": "application/x-tar", "Content-Disposition": `attachment; filename="family-vault-archive-${date}.tar"`, "Cache-Control": "private, no-store" } });
 }
 
 async function collectArchiveMetadata(env: RequestContext["env"]): Promise<Record<string, unknown>> {
-  const [users, albums, photos, joins, comments, reactions] = await Promise.all([
+  const [users, albums, photos, joins, comments, reactions, people, relationships, tags, memories, memoryPhotos] = await Promise.all([
     env.DB.prepare("SELECT id,email,display_name,role,status,created_at FROM users").all(), env.DB.prepare("SELECT * FROM albums").all(),
-    env.DB.prepare("SELECT id,owner_id,caption,event_description,original_filename,mime_type,date_taken,width,height,hash,original_key,gallery_key,thumbnail_key,original_bytes,gallery_bytes,thumbnail_bytes,created_at FROM photos WHERE status='ready'").all(),
-    env.DB.prepare("SELECT * FROM album_photos").all(), env.DB.prepare("SELECT * FROM comments").all(), env.DB.prepare("SELECT * FROM reactions").all()
+    env.DB.prepare("SELECT id,owner_id,caption,event_description,original_filename,mime_type,date_taken,width,height,hash,original_key,gallery_key,thumbnail_key,small_key,original_bytes,gallery_bytes,thumbnail_bytes,small_bytes,created_at FROM photos WHERE status='ready'").all(),
+    env.DB.prepare("SELECT * FROM album_photos").all(), env.DB.prepare("SELECT * FROM comments").all(), env.DB.prepare("SELECT * FROM reactions").all(),
+    env.DB.prepare("SELECT * FROM family_people").all(),env.DB.prepare("SELECT * FROM family_relationships").all(),env.DB.prepare("SELECT * FROM photo_people").all(),
+    env.DB.prepare("SELECT * FROM memories").all(),env.DB.prepare("SELECT * FROM memory_photos").all()
   ]);
-  return { exportedAt: new Date().toISOString(), users: users.results, albums: albums.results, photos: photos.results, albumPhotos: joins.results, comments: comments.results, reactions: reactions.results };
+  return { exportedAt: new Date().toISOString(), users: users.results, albums: albums.results, photos: photos.results, albumPhotos: joins.results, comments: comments.results, reactions: reactions.results,
+    familyPeople:people.results,familyRelationships:relationships.results,photoPeople:tags.results,memories:memories.results,memoryPhotos:memoryPhotos.results };
+
 }
 
 function tarHeader(name: string, size: number, modifiedMs: number): Uint8Array {
@@ -831,10 +934,7 @@ function writeTarOctal(target: Uint8Array, offset: number, length: number, value
   writeTarText(target, offset, length, Math.max(0, value).toString(8).padStart(length - 1, "0") + "\0");
 }
 
-function enqueueTarPadding(controller: ReadableStreamDefaultController<Uint8Array>, size: number): void {
-  const padding = (512 - size % 512) % 512;
-  if (padding) controller.enqueue(new Uint8Array(padding));
-}
+
 
 async function requirePhotoOwner(env: RequestContext["env"], user: NonNullable<RequestContext["user"]>, id: string): Promise<void> {
   const row = await env.DB.prepare("SELECT owner_id FROM photos WHERE id=?").bind(id).first<{ owner_id: string }>();
@@ -846,9 +946,8 @@ async function requirePhotoAccess(env: RequestContext["env"], user: NonNullable<
   if (!row) throw new HttpError(404, "Photo not found.");
 }
 
-function photoAccessSql(alias: string): string {
-  return `(${alias}.owner_id=? OR ?='admin' OR NOT EXISTS (SELECT 1 FROM album_photos access_ap WHERE access_ap.photo_id=${alias}.id) OR EXISTS (SELECT 1 FROM album_photos access_ap JOIN albums access_a ON access_a.id=access_ap.album_id WHERE access_ap.photo_id=${alias}.id AND access_a.visibility='family'))`;
-}
+function photoAccessSql(alias:string):string {return photoAccessPredicate(alias);}
+
 
 async function requireAlbumOwner(env: RequestContext["env"], user: NonNullable<RequestContext["user"]>, id: string): Promise<void> {
   const row = await env.DB.prepare("SELECT owner_id FROM albums WHERE id=?").bind(id).first<{ owner_id: string }>();
@@ -865,14 +964,14 @@ async function settingsMap(env: RequestContext["env"]): Promise<Record<string, s
 }
 
 async function totalStorage(env: RequestContext["env"]): Promise<number> {
-  const row = await env.DB.prepare("SELECT COALESCE(SUM(original_bytes+gallery_bytes+thumbnail_bytes),0) total FROM photos WHERE status='ready'").first<{ total: number }>();
+  const row = await env.DB.prepare("SELECT COALESCE(SUM(original_bytes+gallery_bytes+thumbnail_bytes+small_bytes),0) total FROM photos WHERE status='ready'").first<{ total: number }>();
   return Number(row?.total || 0);
 }
 
 async function cleanupStaleUploads(env: RequestContext["env"]): Promise<void> {
-  const stale = await env.DB.prepare("SELECT id,original_key,gallery_key,thumbnail_key FROM photos WHERE status='pending' AND upload_expires_at <= datetime('now') LIMIT 25").all<Record<string, string | null>>();
+  const stale = await env.DB.prepare("SELECT id,original_key,gallery_key,thumbnail_key,small_key FROM photos WHERE status='pending' AND upload_expires_at <= datetime('now') LIMIT 25").all<Record<string, string | null>>();
   for (const photo of stale.results) {
-    await Promise.all([photo.original_key, photo.gallery_key, photo.thumbnail_key].filter(Boolean).map((key) => env.PHOTOS.delete(key!)));
+    await Promise.all([photo.original_key, photo.gallery_key, photo.thumbnail_key,photo.small_key].filter(Boolean).map((key) => env.PHOTOS.delete(key!)));
     await env.DB.prepare("DELETE FROM photos WHERE id=? AND status='pending'").bind(photo.id).run();
   }
 }
@@ -882,5 +981,5 @@ async function audit(env: RequestContext["env"], actorId: string | null, action:
 }
 
 function positiveInt(value: unknown): number { const n = Number(value); return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0; }
-function nullableDate(value: unknown): string | null { const text = cleanText(value, 32); return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : null; }
+function nullableDate(value: unknown): string | null { const text = cleanText(value, 32); if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return null; const date = new Date(`${text}T12:00:00Z`); return Number.isFinite(date.getTime()) && date.toISOString().slice(0,10) === text ? text : null; }
 function safeFilename(name: string): string { return name.replace(/["\\\r\n/]/g, "_").slice(0, 160); }

@@ -3,6 +3,9 @@ import { HttpError } from "./http";
 import { randomToken, sha256 } from "./security";
 
 const COOKIE = "fv_session";
+export async function sessionTokenHash(request:Request):Promise<string | null> {
+  const token=readCookie(request.headers.get("Cookie"),COOKIE);return token ? sha256(token) : null;
+}
 
 export async function currentUser(request: Request, env: Env): Promise<AuthUser | null> {
   const token = readCookie(request.headers.get("Cookie"), COOKIE);
@@ -11,7 +14,7 @@ export async function currentUser(request: Request, env: Env): Promise<AuthUser 
   const row = await env.DB.prepare(`
     SELECT u.id, u.email, u.display_name, u.role
     FROM sessions s JOIN users u ON u.id = s.user_id
-    WHERE s.id_hash = ? AND s.expires_at > datetime('now') AND u.status = 'active'
+    WHERE s.id_hash = ? AND julianday(s.expires_at) > julianday('now') AND u.status = 'active'
   `).bind(tokenHash).first<{ id: string; email: string; display_name: string; role: "admin" | "member" }>();
   if (!row) return null;
   return { id: row.id, email: row.email, displayName: row.display_name, role: row.role };

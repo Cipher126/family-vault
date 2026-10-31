@@ -12,8 +12,26 @@ export function json(data: unknown, init: ResponseInit = {}): Response {
 export async function readJson<T>(request: Request, maxBytes = 32_768): Promise<T> {
   const length = Number(request.headers.get("content-length") || 0);
   if (length > maxBytes) throw new HttpError(413, "Request is too large.");
-  try { return await request.json<T>(); }
-  catch { throw new HttpError(400, "Invalid JSON request."); }
+  const reader = request.body?.getReader();
+  if (!reader) throw new HttpError(400, "Invalid JSON request.");
+  const decoder = new TextDecoder();
+  let received = 0, text = "";
+  try {
+    while (true) {
+      const {done,value} = await reader.read();
+      if (done) break;
+      received += value.byteLength;
+      if (received > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new HttpError(413, "Request is too large.");
+      }
+      text += decoder.decode(value,{stream:true});
+    }
+    return JSON.parse(text + decoder.decode()) as T;
+  } catch (error) {
+    if (error instanceof HttpError) throw error;
+    throw new HttpError(400, "Invalid JSON request.");
+  } finally { reader.releaseLock(); }
 }
 
 export function requireSameOrigin(request: Request): void {

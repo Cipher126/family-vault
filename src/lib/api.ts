@@ -1,24 +1,45 @@
 export interface User { id: string; email: string; displayName: string; role: "admin" | "member" }
 export interface Photo { id: string; caption: string; event_description?: string; date_taken?: string | null; created_at: string; owner_id?: string; width?: number; height?: number; uploader?: string; memory_reason?: "on_this_day" | "this_month" | "recent" }
-export interface Album { id: string; name: string; description: string; visibility: string; owner_id?: string; cover_photo_id?: string | null; photo_count: number; creator?: string }
+export interface Album { id: string; name: string; description: string; visibility: string; owner_id?: string; cover_photo_id?: string | null; thumbnail_photo_id?: string | null; photo_count: number; creator?: string }
 export interface Comment { id: string; body: string; author_id: string; author: string; created_at: string }
 export interface Reaction { emoji: "heart" | "smile" | "celebrate"; count: number; mine: number }
 export type FamilyGender = "female" | "male" | "unspecified";
 export interface FamilyPerson { id: string; first_name: string; last_name: string; nickname: string; gender?: FamilyGender; birth_date?: string | null; death_date?: string | null; biography: string; profile_photo_id?: string | null; created_by?: string; photo_count: number }
 export interface FamilyRelationship { id: string; person_a_id: string; person_b_id: string; relationship: "parent" | "partner"; created_by?: string }
 
-export async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+const responseCache = new Map<string,{ value:unknown; time:number }>();
+const pendingRequests = new Map<string,Promise<unknown>>();
+let cacheGeneration = 0;
+let cacheUser = "";
+export function clearRequestCache(): void { responseCache.clear();pendingRequests.clear();cacheGeneration++; }
+export function setRequestCacheUser(user: string): void { if (user!==cacheUser) {clearRequestCache();cacheUser=user;} }
+export function peekRequestCache<T>(path:string): T | undefined {
+  const cached=responseCache.get(path);return cached && Date.now()-cached.time<15_000 ? cached.value as T : undefined;
+}
+export function cachedRequest<T>(path:string):Promise<T> {
+  const cached=peekRequestCache<T>(path);return cached===undefined ? request<T>(path) : Promise.resolve(cached);
+}
+export async function request<T>(path:string,init:RequestInit={}):Promise<T> {
+  const method=init.method || "GET";
+  if(method!=="GET") {clearRequestCache();try{return await fetchRequest<T>(path,init);}finally{clearRequestCache();}}
+  if(init.signal || path.startsWith("/api/auth/")) return fetchRequest<T>(path,init);
+  const pending=pendingRequests.get(path);if(pending)return pending as Promise<T>;
+  const generation=cacheGeneration;
+  const task=fetchRequest<T>(path,init).then(value=>{if(generation===cacheGeneration){if(responseCache.size>=40)responseCache.delete(responseCache.keys().next().value!);responseCache.set(path,{value,time:Date.now()});}return value;}).finally(()=>{if(pendingRequests.get(path)===task)pendingRequests.delete(path);});
+  pendingRequests.set(path,task);return task;
+}
+async function fetchRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (import.meta.env.VITE_UI_PREVIEW === "1") return mockRequest(path, init) as T;
   const headers = new Headers(init.headers);
   if (init.body && typeof init.body === "string") headers.set("Content-Type", "application/json");
   const response = await fetch(path, { ...init, headers, credentials: "same-origin" });
   const type = response.headers.get("content-type") || "";
   const data = type.includes("application/json") ? await response.json() as Record<string, unknown> : null;
-  if (!response.ok) throw new Error(typeof data?.error === "string" ? data.error : `Request failed (${response.status})`);
+  if (!response.ok) {if(response.status===401)clearRequestCache();throw new Error(typeof data?.error === "string" ? data.error : `Request failed (${response.status})`);}
   return data as T;
 }
 
-export function photoUrl(id: string, variant: "thumbnail" | "gallery" | "viewer" | "original" = "thumbnail"): string {
+export function photoUrl(id: string, variant: "small" | "thumbnail" | "gallery" | "viewer" | "original" = "small"): string {
   if (import.meta.env.VITE_UI_PREVIEW !== "1") return `/api/photos/${id}/${variant}`;
   const palettes = [["#8f6f58", "#d8b9a1"], ["#5f7365", "#b7c1a9"], ["#8c665f", "#d6aaa0"], ["#646b78", "#aeb6c2"], ["#9a815e", "#d8c69f"]];
   const index = Math.abs(Array.from(id).reduce((n, c) => n + c.charCodeAt(0), 0)) % palettes.length;
@@ -45,6 +66,7 @@ function mockRequest(path: string, init: RequestInit): unknown {
   if (/^\/api\/photos\/[^/]+\/comments$/.test(path) && (!init.method || init.method === "GET")) return { comments: [{ id: "c1", body: "This one always makes me smile.", author_id: "2", author: "David Okafor", created_at: new Date(Date.now() - 86400000).toISOString() }], reactions: [{ emoji: "heart", count: 4, mine: 1 }] };
   if (path.startsWith("/api/photos?album=")) return { photos: photos.slice(0, 7) };
   if (path.startsWith("/api/photos")) return { photos, nextCursor: null };
+  if (path === "/api/memories") return { memories: [] };
   if (path === "/api/albums") return { albums };
   if (path === "/api/family-tree") return { people: familyPeople, relationships: familyRelationships };
   if (/^\/api\/family-tree\/people\/[^/]+\/photos$/.test(path)) return { photos: photos.slice(0, 6) };

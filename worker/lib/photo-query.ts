@@ -9,6 +9,7 @@ export function photoQuery(url: URL, user: { id: string; role: string }, access:
   const bindings: (string | number)[] = [user.id, user.role];
   for (const [param, condition] of [
     ["album", "EXISTS (SELECT 1 FROM album_photos ap JOIN albums a ON a.id=ap.album_id WHERE ap.photo_id=p.id AND ap.album_id=? AND (a.visibility='family' OR a.owner_id=? OR ?='admin'))"],
+    ["batch", "EXISTS (SELECT 1 FROM upload_batch_photos bp WHERE bp.photo_id=p.id AND bp.batch_id=?)"],
     ["memory", "EXISTS (SELECT 1 FROM memory_photos mp WHERE mp.photo_id=p.id AND mp.memory_id=?)"],
     ["from", "p.date_taken>=?"], ["to", "p.date_taken<=?"],
   ]) {

@@ -60,19 +60,32 @@ function mockRequest(path: string, init: RequestInit): unknown {
     { id: "p5", first_name: "Ada", last_name: "Okafor", nickname: "", birth_date: "2004-03-08", biography: "", profile_photo_id: "memory-5", photo_count: 9 }
   ];
   const familyRelationships: FamilyRelationship[] = [{ id: "r1", person_a_id: "p1", person_b_id: "p3", relationship: "parent" }, { id: "r2", person_a_id: "p2", person_b_id: "p3", relationship: "parent" }, { id: "r3", person_a_id: "p1", person_b_id: "p4", relationship: "parent" }, { id: "r4", person_a_id: "p2", person_b_id: "p4", relationship: "parent" }, { id: "r5", person_a_id: "p3", person_b_id: "p5", relationship: "parent" }, { id: "r6", person_a_id: "p1", person_b_id: "p2", relationship: "partner" }];
+  if(path==='/api/file-folders')return {folders:[{id:'family-documents',name:'Family documents',owner_id:'preview-admin',protected:false,locked:false},{id:'protected-documents',name:'Personal documents',owner_id:'another-member',protected:true,locked:true}],nextCursor:null};
+  if(path.startsWith('/api/files')){
+    const folderId=new URL(path,'https://preview').searchParams.get('folder');
+    const folder=folderId ? {id:folderId,name:folderId==='protected-documents'?'Personal documents':'Family documents',owner_id:'another-member',protected:folderId==='protected-documents',locked:folderId==='protected-documents'} : null;
+    const files=[{id:'preview-file-001',name:'Family reunion plans.pdf',size:148000,owner_id:'preview-admin',uploader:'Amara',folder_id:folderId,created_at:new Date().toISOString()},{id:'preview-file-002',name:'Grandpa’s favourite songs.mp3',size:3890000,owner_id:'another-member',uploader:'David',folder_id:folderId,created_at:new Date().toISOString()}];
+    if(/^\/api\/files\/[^/]+$/.test(path))return {file:files[0],folder:null};
+    return {files:folder?.locked?[]:files,folder,total:folder?.locked?0:files.length,nextCursor:null};
+  }
   if (path === "/api/auth/me") return { user: { id: "preview-admin", email: "admin@family.local", displayName: "Amara Okafor", role: "admin" } };
   if (path === "/api/config") return { siteName: "Family Vault" };
   if (path === "/api/dashboard") return { photos: photos.slice(0, 8), memories: photos.slice(0, 8).map((photo, index) => ({ ...photo, memory_reason: index < 2 ? "on_this_day" : index < 5 ? "this_month" : "recent" })), albums, activity: [{ action: "photo.uploaded", created_at: new Date().toISOString() }, { action: "album.created", created_at: new Date(Date.now() - 86400000).toISOString() }, { action: "member.registered", created_at: new Date(Date.now() - 172800000).toISOString() }] };
   if (/^\/api\/photos\/[^/]+\/comments$/.test(path) && (!init.method || init.method === "GET")) return { comments: [{ id: "c1", body: "This one always makes me smile.", author_id: "2", author: "David Okafor", created_at: new Date(Date.now() - 86400000).toISOString() }], reactions: [{ emoji: "heart", count: 4, mine: 1 }] };
-  if (path.startsWith("/api/photos?album=")) return { photos: photos.slice(0, 7) };
-  if (path.startsWith("/api/photos")) return { photos, nextCursor: null };
+  if (/^\/api\/photos\/[^/]+\/people$/.test(path) && (!init.method || init.method === "GET")) return { people: familyPeople.slice(0, 2) };
+  if (/^\/api\/photos\/[^/]+$/.test(path) && (!init.method || init.method === "GET")) return {photo:photos.find(photo=>photo.id===path.split('/').pop()) || photos[0]};
+  if (/^\/api\/albums\/[^/]+$/.test(path) && (!init.method || init.method === "GET")) return {album:albums.find(album=>album.id===path.split('/').pop()) || albums[0]};
+  if (/^\/api\/upload-batches\/[^/]+$/.test(path)) return {collection:{id:path.split('/').pop(),title:'Shared family pictures',photo_count:photos.length,visibility:'family',uploader:'Amara'}};
+  if(path.startsWith('/api/upload-batches?') || path==='/api/upload-batches')return {collections:[{id:'preview-collection-123456',title:'Our family gathering',photo_count:photos.length,uploader:'Amara',visibility:'family',thumbnail_photo_id:photos[0].id}],nextCursor:null};
+  if(path==='/api/admin/uploads')return {collections:[],emailConfigured:false};
+  if (path.startsWith("/api/photos?album=")) return { photos: photos.slice(0, 7),total:7,nextCursor:null };
+  if (path.startsWith("/api/photos")) return { photos,total:photos.length,nextCursor:null };
   if (path === "/api/memories") return { memories: [] };
   if (path === "/api/albums") return { albums };
   if (path === "/api/family-tree") return { people: familyPeople, relationships: familyRelationships };
   if (/^\/api\/family-tree\/people\/[^/]+\/photos$/.test(path)) return { photos: photos.slice(0, 6) };
-  if (/^\/api\/photos\/[^/]+\/people$/.test(path) && (!init.method || init.method === "GET")) return { people: familyPeople.slice(0, 2) };
-  if (path.startsWith("/api/timeline")) return { photos };
-  if (path.startsWith("/api/search")) return { photos: photos.slice(0, 5), albums: albums.slice(0, 2) };
+  if (path.startsWith("/api/timeline")) return { photos,nextCursor:null };
+  if (path.startsWith("/api/search")) return { photos: photos.slice(0, 5), albums: albums.slice(0, 2),total:7,nextCursor:null };
   if (path === "/api/admin/members") return { members: [{ id: "1", email: "admin@family.local", display_name: "Amara Okafor", role: "admin", status: "active", created_at: "2026-01-01" }, { id: "2", email: "david@family.local", display_name: "David Okafor", role: "member", status: "active", created_at: "2026-02-01" }], invitations: [] };
   if (path === "/api/admin/storage") return { photo_count: 94, total_bytes: 2684354560, quota_bytes: 8589934592, warning_percent: 80, estimated_monthly_usd: 0, can_seed_samples: true };
   if (path === "/api/admin/settings") return { settings: { site_name: "Family Vault", preserve_originals: "true", max_upload_bytes: "20971520", storage_quota_bytes: "8589934592", storage_warning_percent: "80", members_can_create_albums: "true" } };

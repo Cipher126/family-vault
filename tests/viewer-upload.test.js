@@ -47,16 +47,18 @@ describe("mobile collections",()=>{
 it("does not skip a newly selected upload with the same filename",async()=>{
   const prepared={gallery:new Blob(["g"]),thumbnail:new Blob(["t"]),small:new Blob(["s"]),width:10,height:10,hash:"x",dateTaken:null};
   vi.mocked(preparePhoto).mockResolvedValue(prepared);
-  vi.mocked(post).mockImplementation(async path=>path.endsWith("/init") ? {id:"p",preserveOriginal:false,upload:{gallery:"/g",thumbnail:"/t",small:"/s"}} : {ok:true});
+  vi.mocked(post).mockImplementation(async path=>path.endsWith("/init") ? {id:"p",preserveOriginal:false,upload:{gallery:"/g",thumbnail:"/t",small:"/s"}} : path==="/api/upload-batches" ? {id:"batch-one",albumId:"album-one"} : {ok:true,path:"/collections/batch-one"});
+  vi.mocked(request).mockResolvedValue({collection:{photo_count:1,visibility:"family"}});
   vi.stubGlobal("fetch",vi.fn(async()=>({ok:true})));
   const {container}=render(React.createElement(UploadDialog,{onClose:vi.fn()}));
   const input=container.querySelector('input[type="file"]');
   fireEvent.change(input,{target:{files:[new File(["first"],"image.jpg",{type:"image/jpeg"})]}});
   fireEvent.click(screen.getByRole("button",{name:"Upload 1 photo"}));
-  await screen.findByRole("button",{name:"All photographs uploaded"});
-  fireEvent.change(input,{target:{files:[new File(["different"],"image.jpg",{type:"image/jpeg"})]}});
+  await screen.findByRole("button",{name:"Done"});
+  fireEvent.click(screen.getByRole("button",{name:"Start another collection"}));
+  fireEvent.change(container.querySelector('input[type="file"]'),{target:{files:[new File(["different"],"image.jpg",{type:"image/jpeg"})]}});
   fireEvent.click(screen.getByRole("button",{name:"Upload 1 photo"}));
-  await screen.findByRole("button",{name:"All photographs uploaded"});
+  await screen.findByRole("button",{name:"Done"});
   expect(preparePhoto).toHaveBeenCalledTimes(2);
 });
 
@@ -82,4 +84,21 @@ it.each(["mobile","desktop"])("does not show a previous photo's comments in the 
   await act(async()=>first.resolve({comments:[{id:"c1",body:"Wrong old note",author:"A",author_id:"a",created_at:"2026-10-31"}],reactions:[]}));
   expect(screen.queryByText("Wrong old note")).toBeNull();
   if(mode==="desktop")expect(screen.getByText("Second note")).toBeTruthy();
+});
+
+it.each(['mobile','desktop'])('shares the selected individual photo from its three-dot menu on %s',async mode=>{
+  vi.stubGlobal('matchMedia',query=>({matches:mode==='desktop' ? query.includes('min-width') : query.includes('max-width')}));
+  const copy=vi.fn().mockResolvedValue(undefined);vi.stubGlobal('navigator',{clipboard:{writeText:copy}});
+  vi.mocked(request).mockImplementation(async path=>path.endsWith('/comments') ? {comments:[],reactions:[]} : {people:[]});
+  const props={photos:[photo('one'),photo('two')],index:0,setIndex:vi.fn(),onClose:vi.fn()};
+  const {rerender}=render(React.createElement(Viewer,props));
+  const share=()=>{fireEvent.click(screen.getByRole('button',{name:'Photo actions'}));fireEvent.click(screen.getByRole('menuitem',{name:'Share photograph'}));};
+  share();
+  const whatsapp=new URL(screen.getByRole('menuitem',{name:'Send on WhatsApp'}).getAttribute('href'));
+  expect(whatsapp.searchParams.get('text')).toContain('/photos/one');
+  fireEvent.click(screen.getByRole('menuitem',{name:'Copy photo link'}));await screen.findByRole('menuitem',{name:'Photo link copied'});
+  expect(copy).toHaveBeenLastCalledWith(`${window.location.origin}/photos/one`);
+  rerender(React.createElement(Viewer,{...props,index:1}));share();
+  fireEvent.click(screen.getByRole('menuitem',{name:'Copy photo link'}));await screen.findByRole('menuitem',{name:'Photo link copied'});
+  expect(copy).toHaveBeenLastCalledWith(`${window.location.origin}/photos/two`);
 });

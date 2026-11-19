@@ -10,6 +10,8 @@ A private, invitation-only family photo archive built with React, TypeScript, Cl
 - Streamed authenticated uploads to a private R2 binding
 - Responsive gallery with multi-photo actions, a scrollable fit-to-screen fullscreen viewer, albums, a filterable timeline, comments/reactions API, search, and download
 - A memory-linked family tree with relative profiles, parent/partner relationships, photo tagging, and per-person galleries
+- Private collection, album, and individual-photo links with sign-in return and WhatsApp sharing
+- One Gmail SMTP alert per completed family upload collection; see [email setup](EMAIL_SETUP.md)
 - Admin membership, invitation, media review, storage/quota, settings, metadata export, and audit records
 - D1 migration, tests, Cloudflare deployment configuration, and operations documentation
 
@@ -85,3 +87,5 @@ Before production, change `APP_ENV` to `production` in `wrangler.jsonc`. Never c
 - Private media responses use `private, no-store`; static application assets remain CDN-cacheable.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md), [SECURITY.md](SECURITY.md), [COSTS.md](COSTS.md), and [BACKUP.md](BACKUP.md) before deployment.
+
+File sharing: see [FILE_SHARING.md](FILE_SHARING.md) for folders, password protection, limits, and backup behavior.

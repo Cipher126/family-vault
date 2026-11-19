@@ -1,3 +1,6 @@
+import {fileRoutes} from './files';
+import {reservedStorageSql} from '../lib/file-storage';
+import {listUploadBatches,createUploadBatch,getUploadBatch,completeUploadBatch,getSharedAlbum,getSharedPhoto,adminUploadActivity} from "./sharing";
 import {collectionOffset,collectionPage} from "../lib/pagination";
 import type { Env, RequestContext } from "../types";
 import { createSession, deleteSession, expiredSessionCookie, requireAdmin, requireUser } from "../lib/auth";
@@ -32,6 +35,13 @@ export async function api(ctx: RequestContext): Promise<Response> {
   if (method === "GET" && url.pathname === "/api/config") return json({ siteName: await setting(ctx.env, "site_name") || "Family Vault" });
 
   const user = requireUser(ctx.user);
+  const fileResponse=await fileRoutes(ctx);if(fileResponse)return fileResponse;
+  if(method==='GET' && url.pathname==='/api/upload-batches')return listUploadBatches(ctx);
+  if(method==='POST' && url.pathname==='/api/upload-batches')return createUploadBatch(ctx);
+  const batch=url.pathname.match(/^\/api\/upload-batches\/([^/]+)$/);
+  if(method==='GET' && batch)return getUploadBatch(ctx,batch[1]);
+  const finishedBatch=url.pathname.match(/^\/api\/upload-batches\/([^/]+)\/complete$/);
+  if(method==='POST' && finishedBatch)return completeUploadBatch(ctx,finishedBatch[1]);
   if (url.pathname === "/api/memories" && method === "GET") return listMemories(ctx);
   if (url.pathname === "/api/memories" && method === "POST") return createMemory(ctx);
   if (url.pathname === "/api/photos/bulk" && method === "PATCH") return bulkEditPhotos(ctx);
@@ -66,6 +76,7 @@ export async function api(ctx: RequestContext): Promise<Response> {
   if (method === "GET" && photoPeople) return listPhotoPeople(ctx, photoPeople[1]);
   if (method === "POST" && photoPeople) return tagPhotoPerson(ctx, photoPeople[1]);
   const photo = url.pathname.match(/^\/api\/photos\/([^/]+)$/);
+  if (method === "GET" && photo) return getSharedPhoto(ctx,photo[1]);
   if (method === "PATCH" && photo) return updatePhoto(ctx, photo[1]);
   if (method === "DELETE" && photo) return deletePhoto(ctx, photo[1]);
   const comments = url.pathname.match(/^\/api\/photos\/([^/]+)\/comments$/);
@@ -80,10 +91,12 @@ export async function api(ctx: RequestContext): Promise<Response> {
   const albumPhoto = url.pathname.match(/^\/api\/albums\/([^/]+)\/photos$/);
   if (method === "POST" && albumPhoto) return addPhotoToAlbum(ctx, albumPhoto[1]);
   const album = url.pathname.match(/^\/api\/albums\/([^/]+)$/);
+  if (method === "GET" && album) return getSharedAlbum(ctx,album[1]);
   if (method === "PATCH" && album) return updateAlbum(ctx, album[1]);
   if (method === "DELETE" && album) return deleteAlbum(ctx, album[1]);
 
   if (url.pathname.startsWith("/api/admin/")) requireAdmin(user);
+  if (method === "GET" && url.pathname === "/api/admin/uploads") return adminUploadActivity(ctx);
   if (method === "GET" && url.pathname === "/api/admin/members") return adminMembers(ctx);
   if (method === "POST" && url.pathname === "/api/admin/invitations") return createInvitation(ctx);
   if (method === "DELETE" && url.pathname.match(/^\/api\/admin\/invitations\/[^/]+$/)) return revokeInvitation(ctx, url.pathname.split("/").pop()!);
@@ -196,7 +209,7 @@ async function dashboard({ env, user }: RequestContext): Promise<Response> {
     ].map(group=>env.DB.prepare(`SELECT p.id,p.caption,p.event_description,p.date_taken,p.created_at,p.owner_id,p.width,p.height,u.display_name uploader,'${group.reason}' memory_reason
       FROM photos p JOIN users u ON u.id=p.owner_id WHERE p.status='ready' AND ${group.where} AND ${photoAccessSql("p")} ORDER BY ${group.order} LIMIT 10`).bind(user!.id,user!.role)))
       .then(pages=>({results:pages.flatMap(page=>page.results).filter((row,index,all)=>all.findIndex(other=>other.id===row.id)===index).slice(0,10)})),
-    env.DB.prepare(`SELECT a.id,a.name,a.description,a.cover_photo_id,${albumThumbnailSql()},COUNT(ap.photo_id) photo_count,a.created_at FROM albums a LEFT JOIN album_photos ap ON ap.album_id=a.id WHERE a.visibility='family' OR a.owner_id=? GROUP BY a.id ORDER BY a.created_at DESC LIMIT 5`).bind(user!.id).all(),
+    env.DB.prepare(`SELECT a.id,a.name,a.description,a.cover_photo_id,${albumThumbnailSql()},(SELECT COUNT(*) FROM album_photos count_ap JOIN photos count_p ON count_p.id=count_ap.photo_id WHERE count_ap.album_id=a.id AND count_p.status='ready') photo_count,a.created_at FROM albums a LEFT JOIN album_photos ap ON ap.album_id=a.id WHERE a.visibility='family' OR a.owner_id=? GROUP BY a.id ORDER BY a.created_at DESC LIMIT 5`).bind(user!.id).all(),
     env.DB.prepare("SELECT action,target_type,created_at FROM audit_logs ORDER BY created_at DESC LIMIT 8").all()
   ]);
   return json({ photos: photos.results, memories: memories.results, albums: albums.results, activity: activity.results });
@@ -207,7 +220,7 @@ function albumThumbnailSql(): string {
 }
 
 async function listAlbums({ env, user }: RequestContext): Promise<Response> {
-  const rows = await env.DB.prepare(`SELECT a.id,a.name,a.description,a.visibility,a.owner_id,a.cover_photo_id,${albumThumbnailSql()},a.created_at,u.display_name creator,COUNT(ap.photo_id) photo_count
+  const rows = await env.DB.prepare(`SELECT a.id,a.name,a.description,a.visibility,a.owner_id,a.cover_photo_id,${albumThumbnailSql()},a.created_at,u.display_name creator,(SELECT COUNT(*) FROM album_photos count_ap JOIN photos count_p ON count_p.id=count_ap.photo_id WHERE count_ap.album_id=a.id AND count_p.status='ready') photo_count
     FROM albums a JOIN users u ON u.id=a.owner_id LEFT JOIN album_photos ap ON ap.album_id=a.id
     WHERE a.visibility='family' OR a.owner_id=? OR ?='admin' GROUP BY a.id ORDER BY a.updated_at DESC`).bind(user!.id, user!.role).all();
   return json({ albums: rows.results });
@@ -452,6 +465,9 @@ async function bulkEditPhotos({ request, env, user }: RequestContext): Promise<R
 async function initPhoto({ request, env, user }: RequestContext): Promise<Response> {
   await cleanupStaleUploads(env);
   const body = await readJson<Body>(request);
+  const batchId=cleanText(body.batchId,64);
+  const batch=batchId ? await env.DB.prepare("SELECT owner_id,album_id,completed_at FROM upload_batches WHERE id=?").bind(batchId).first<{owner_id:string;album_id:string|null;completed_at:string|null}>() : null;
+  if(batchId && (!batch || batch.owner_id!==user!.id || batch.completed_at || !batch.album_id))throw new HttpError(409,"This upload collection is no longer open.");
   const mimeType = cleanText(body.mimeType, 80);
   const originalFilename = cleanText(body.filename, 240);
   const originalBytes = positiveInt(body.originalBytes);
@@ -481,10 +497,13 @@ async function initPhoto({ request, env, user }: RequestContext): Promise<Respon
     id,owner_id,caption,event_description,original_filename,mime_type,date_taken,width,height,hash,
     original_key,gallery_key,thumbnail_key,small_key,expected_original_bytes,expected_gallery_bytes,expected_thumbnail_bytes,expected_small_bytes,upload_expires_at
   ) SELECT ${values.map(()=>"?").join(",")},datetime('now','+1 hour')
-    WHERE COALESCE((SELECT SUM(CASE WHEN status='ready' THEN original_bytes+gallery_bytes+thumbnail_bytes+small_bytes
-      WHEN status='pending' AND upload_expires_at > datetime('now') THEN expected_original_bytes+expected_gallery_bytes+expected_thumbnail_bytes+expected_small_bytes ELSE 0 END) FROM photos),0)+?<=?`)
+    WHERE (${reservedStorageSql})+?<=?`)
     .bind(...values,incoming,quota).run();
   if (!reservation.meta.changes) throw new HttpError(413, "The family storage quota would be exceeded.");
+  if(batch && batchId)await env.DB.batch([
+    env.DB.prepare('INSERT INTO upload_batch_photos(batch_id,photo_id) VALUES(?,?)').bind(batchId,id),
+    env.DB.prepare('INSERT OR IGNORE INTO album_photos(album_id,photo_id,added_by) VALUES(?,?,?)').bind(batch.album_id,id,user!.id)
+  ]);
   return json({ id, preserveOriginal: preserve, upload: { small:smallBytes ? `/api/photos/${id}/upload/small` : null, gallery: `/api/photos/${id}/upload/gallery`, thumbnail: `/api/photos/${id}/upload/thumbnail`, original: preserve ? `/api/photos/${id}/upload/original` : null } }, { status: 201 });
 }
 
@@ -517,8 +536,9 @@ async function completePhoto({ env, user }: RequestContext, id: string): Promise
     await env.DB.prepare("DELETE FROM photos WHERE id=? AND status='pending'").bind(id).run();
     throw new HttpError(413, "Uploaded files did not match their reserved sizes. Please retry.");
   }
-  await env.DB.prepare("UPDATE photos SET status='ready',original_bytes=?,gallery_bytes=?,thumbnail_bytes=?,small_bytes=?,upload_expires_at=NULL,updated_at=datetime('now') WHERE id=?")
+  const completed = await env.DB.prepare("UPDATE photos SET status='ready',original_bytes=?,gallery_bytes=?,thumbnail_bytes=?,small_bytes=?,upload_expires_at=NULL,updated_at=datetime('now') WHERE id=? AND NOT EXISTS(SELECT 1 FROM upload_batch_photos bp JOIN upload_batches b ON b.id=bp.batch_id WHERE bp.photo_id=photos.id AND b.completed_at IS NOT NULL)")
     .bind(original?.size || 0, gallery.size, thumbnail.size,small?.size || 0, id).run();
+  if(!completed.meta.changes)throw new HttpError(409,"This collection has already been shared. Start a new upload.");
   await audit(env, user!.id, "photo.uploaded", "photo", id);
   return json({ id, ok: true });
 }
@@ -693,7 +713,7 @@ async function search({ env, url, user }: RequestContext): Promise<Response> {
   const albumBindings=[user!.id,user!.role,pattern,pattern];
   const [photos,albums,photoTotal,albumTotal]=await Promise.all([
     env.DB.prepare(`SELECT p.id,p.caption,p.event_description,p.date_taken,p.created_at,p.owner_id,p.width,p.height,u.display_name uploader ${photoFrom} ORDER BY p.created_at DESC,p.id DESC LIMIT 101 OFFSET ?`).bind(...photoBindings,offset*100).all(),
-    env.DB.prepare(`SELECT a.id,a.name,a.description,a.visibility,a.owner_id,a.cover_photo_id,${albumThumbnailSql()},u.display_name creator,(SELECT COUNT(*) FROM album_photos ap WHERE ap.album_id=a.id) photo_count ${albumFrom} ORDER BY a.updated_at DESC,a.id DESC LIMIT 21 OFFSET ?`).bind(...albumBindings,offset*20).all(),
+    env.DB.prepare(`SELECT a.id,a.name,a.description,a.visibility,a.owner_id,a.cover_photo_id,${albumThumbnailSql()},u.display_name creator,(SELECT COUNT(*) FROM album_photos ap JOIN photos count_p ON count_p.id=ap.photo_id WHERE ap.album_id=a.id AND count_p.status='ready') photo_count ${albumFrom} ORDER BY a.updated_at DESC,a.id DESC LIMIT 21 OFFSET ?`).bind(...albumBindings,offset*20).all(),
     env.DB.prepare(`SELECT COUNT(*) total ${photoFrom}`).bind(...photoBindings).first<{total:number}>(),
     env.DB.prepare(`SELECT COUNT(*) total ${albumFrom}`).bind(...albumBindings).first<{total:number}>()
   ]);
@@ -770,7 +790,9 @@ async function updateMember({ request, env, user }: RequestContext, id: string):
 async function storage({ env, url }: RequestContext): Promise<Response> {
   const config = await settingsMap(env);
   const row = await env.DB.prepare("SELECT COUNT(*) photo_count,COALESCE(SUM(original_bytes+gallery_bytes+thumbnail_bytes+small_bytes),0) total_bytes FROM photos WHERE status='ready'").first();
-  return json({ ...(row || {}), quota_bytes: Number(config.storage_quota_bytes), warning_percent: Number(config.storage_warning_percent), estimated_monthly_usd: Math.max(0, (Number((row as Record<string, number>)?.total_bytes || 0) / 1_000_000_000 - 10) * 0.015), can_seed_samples: env.APP_ENV === "development" && ["localhost", "127.0.0.1"].includes(url.hostname) });
+  const files=await env.DB.prepare("SELECT COUNT(*) file_count,COALESCE(SUM(size),0) file_bytes FROM shared_files WHERE status='ready'").first<{file_count:number;file_bytes:number}>();
+  const totals={...(row as Record<string,number> || {}),file_count:files?.file_count||0,file_bytes:files?.file_bytes||0,total_bytes:Number((row as Record<string,number>)?.total_bytes||0)+Number(files?.file_bytes||0)};
+  return json({ ...totals, quota_bytes: Number(config.storage_quota_bytes), warning_percent: Number(config.storage_warning_percent), estimated_monthly_usd: Math.max(0, (totals.total_bytes / 1_000_000_000 - 10) * 0.015), can_seed_samples: env.APP_ENV === "development" && ["localhost", "127.0.0.1"].includes(url.hostname) });
 }
 
 async function seedDevelopmentPhotos({ env, url, user }: RequestContext): Promise<Response> {
@@ -877,6 +899,14 @@ async function exportArchive({ env }: RequestContext): Promise<Response> {
       } finally { await reader.cancel().catch(()=>undefined);reader.releaseLock(); }
       if (object.size % 512) yield new Uint8Array(512-object.size % 512);
     }
+    for(const file of metadata.sharedFiles as Array<{id:string;name:string;object_key:string;created_at:string}>) {
+      const object=await env.PHOTOS.get(file.object_key);if(!object?.body)continue;
+      yield tarHeader(`files/${file.id}-${safeFilename(file.name)}`.slice(0,99),object.size,Date.parse(file.created_at)||Date.now());
+      const reader=object.body.getReader();
+      try{while(true){const chunk=await reader.read();if(chunk.done)break;yield chunk.value;}}
+      finally{await reader.cancel().catch(()=>undefined);reader.releaseLock();}
+      if(object.size%512)yield new Uint8Array(512-object.size%512);
+    }
     yield new Uint8Array(1024);
   }
   const iterator=chunks();
@@ -892,15 +922,18 @@ async function exportArchive({ env }: RequestContext): Promise<Response> {
 }
 
 async function collectArchiveMetadata(env: RequestContext["env"]): Promise<Record<string, unknown>> {
-  const [users, albums, photos, joins, comments, reactions, people, relationships, tags, memories, memoryPhotos] = await Promise.all([
+  const [users, albums, photos, joins, comments, reactions, people, relationships, tags, memories, memoryPhotos, uploadBatches, batchPhotos, fileFolders, sharedFiles] = await Promise.all([
     env.DB.prepare("SELECT id,email,display_name,role,status,created_at FROM users").all(), env.DB.prepare("SELECT * FROM albums").all(),
     env.DB.prepare("SELECT id,owner_id,caption,event_description,original_filename,mime_type,date_taken,width,height,hash,original_key,gallery_key,thumbnail_key,small_key,original_bytes,gallery_bytes,thumbnail_bytes,small_bytes,created_at FROM photos WHERE status='ready'").all(),
     env.DB.prepare("SELECT * FROM album_photos").all(), env.DB.prepare("SELECT * FROM comments").all(), env.DB.prepare("SELECT * FROM reactions").all(),
     env.DB.prepare("SELECT * FROM family_people").all(),env.DB.prepare("SELECT * FROM family_relationships").all(),env.DB.prepare("SELECT * FROM photo_people").all(),
-    env.DB.prepare("SELECT * FROM memories").all(),env.DB.prepare("SELECT * FROM memory_photos").all()
+    env.DB.prepare("SELECT * FROM memories").all(),env.DB.prepare("SELECT * FROM memory_photos").all(),
+    env.DB.prepare("SELECT id,title,owner_id,album_id,created_at,completed_at FROM upload_batches").all(),env.DB.prepare("SELECT * FROM upload_batch_photos").all(),
+    env.DB.prepare("SELECT id,name,owner_id,(password_hash IS NOT NULL) password_protected,created_at FROM file_folders").all(),
+    env.DB.prepare("SELECT id,owner_id,folder_id,name,mime_type,size,object_key,created_at FROM shared_files WHERE status='ready'").all()
   ]);
   return { exportedAt: new Date().toISOString(), users: users.results, albums: albums.results, photos: photos.results, albumPhotos: joins.results, comments: comments.results, reactions: reactions.results,
-    familyPeople:people.results,familyRelationships:relationships.results,photoPeople:tags.results,memories:memories.results,memoryPhotos:memoryPhotos.results };
+    familyPeople:people.results,familyRelationships:relationships.results,photoPeople:tags.results,memories:memories.results,memoryPhotos:memoryPhotos.results,uploadBatches:uploadBatches.results,uploadBatchPhotos:batchPhotos.results,fileFolders:fileFolders.results,sharedFiles:sharedFiles.results };
 
 }
 

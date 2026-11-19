@@ -1,3 +1,5 @@
+import {sendSmtpEmail} from "../worker/lib/smtp";
+vi.mock("../worker/lib/smtp",async original=>({...await original<object>(),sendSmtpEmail:vi.fn()}));
 import {DatabaseSync} from "node:sqlite";
 import {readFileSync,readdirSync} from "node:fs";
 import {afterEach,beforeEach,describe,expect,it,vi} from "vitest";
@@ -7,6 +9,7 @@ import {readJson} from "../worker/lib/http";
 import {rateLimit} from "../worker/lib/rate-limit";
 import {sha256,verifyPassword} from "../worker/lib/security";
 import {photoAccessPredicate} from "../worker/lib/photo-access";
+import {deliverUploadEmail,retryUploadEmails} from "../worker/lib/upload-email";
 import type {Env,RequestContext} from "../worker/types";
 
 let db:DatabaseSync,env:Env;
@@ -34,7 +37,7 @@ beforeEach(()=>{
   }},PHOTOS:{get:vi.fn()},APP_ENV:"production"} as unknown as Env;
   db.exec("INSERT INTO users(id,email,display_name,password_hash,role) VALUES('a','a@x.co','A','old','admin'),('b','b@x.co','B','old','member'),('c','c@x.co','C','old','member')");
 });
-afterEach(()=>{db.close();vi.restoreAllMocks();});
+afterEach(()=>{db.close();vi.restoreAllMocks();vi.clearAllMocks();vi.unstubAllGlobals();});
 
 describe("authorization against real SQLite",()=>{
   it("does not let private bookmarks hide another person's shared photo",()=>{
@@ -122,4 +125,93 @@ it("paginates search, timeline and person memories without losing results",async
     expect(new Set([...first.photos,...last.photos].map((photo:any)=>photo.id)).size).toBe(125);
     if(path.includes("search")){expect(first.total).toBe(150);expect(first.albums).toHaveLength(20);expect(last.albums).toHaveLength(5);}
   }
+});
+
+describe('private collection sharing and admin email',()=>{
+  const batchId='park-collection-123456';
+  const member={id:'b',email:'b@x.co',displayName:'B',role:'member' as const};
+  async function create(visibility='family',albumId?:string){
+    const response=await api(context('/api/upload-batches',{id:batchId,title:'Day at the park',visibility,albumId}));
+    return await response.json() as {id:string;albumId:string};
+  }
+  function picture(id:string,albumId:string,batch=true){
+    db.prepare("INSERT INTO photos(id,owner_id,original_filename,mime_type,status) VALUES(?,'a','p.jpg','image/jpeg','ready')").run(id);
+    db.prepare("INSERT INTO album_photos(album_id,photo_id,added_by) VALUES(?,?,'a')").run(albumId,id);
+    if(batch)db.prepare('INSERT INTO upload_batch_photos(batch_id,photo_id) VALUES(?,?)').run(batchId,id);
+  }
+  function configureMail(){
+    env.ADMIN_UPLOAD_EMAIL='admin@example.com';env.SMTP_USER='sender@example.com';env.SMTP_PASSWORD='test-only';env.PUBLIC_APP_URL='https://family-vault.cipher126.workers.dev';
+    db.exec("UPDATE users SET email='admin@example.com' WHERE id='a'");
+  }
+  it('lets any authorized family member find and reshare old collections without sending another email',async()=>{
+    const batch=await create();picture('saved-picture',batch.albumId);
+    await api(context(`/api/upload-batches/${batchId}/complete`,{}));
+    db.exec("UPDATE upload_batches SET completed_at='2000-01-01 12:00:00'; INSERT INTO albums(id,name,owner_id,visibility) VALUES('private','Private','a','private'); INSERT INTO upload_batches(id,title,owner_id,album_id,completed_at) VALUES('private-batch','Private','a','private',datetime('now')),('draft-batch','Draft','a','private',NULL)");
+    const data=await (await api(context('/api/upload-batches',undefined,member))).json() as any;
+    expect(data.collections.map((item:any)=>item.id)).toEqual([batchId]);
+    expect(data.collections[0].thumbnail_photo_id).toBe('saved-picture');expect(data.collections[0].photo_count).toBe(1);
+    expect((await api(context(`/api/upload-batches/${batchId}`,undefined,member))).status).toBe(200);
+    expect(sendSmtpEmail).not.toHaveBeenCalled();
+    await expect(api(context('/api/upload-batches',undefined,null))).rejects.toMatchObject({status:401});
+  });
+  it('keeps all collection history available through pagination',async()=>{
+    db.exec("INSERT INTO albums(id,name,owner_id) VALUES('shared-history','History','a')");
+    for(let index=0;index<105;index++)db.prepare("INSERT INTO upload_batches(id,title,owner_id,album_id,completed_at) VALUES(?,'Old collection','a','shared-history','2000-01-01 12:00:00')").run(`saved-collection-${String(index).padStart(3,'0')}`);
+    const first=await (await api(context('/api/upload-batches',undefined,member))).json() as any;
+    expect(first.collections).toHaveLength(100);expect(first.nextCursor).toBe('100');
+    const next=await (await api(context(`/api/upload-batches?cursor=${first.nextCursor}`,undefined,member))).json() as any;
+    expect(next.collections).toHaveLength(5);expect(next.nextCursor).toBeNull();
+    expect(new Set([...first.collections,...next.collections].map((item:any)=>item.id)).size).toBe(105);
+  });
+  it('gives one exact upload collection a link even inside an older album',async()=>{
+    db.exec("INSERT INTO albums(id,name,owner_id) VALUES('old-album','Old album','a')");
+    const batch=await create('family','old-album');picture('older-picture',batch.albumId,false);picture('new-picture',batch.albumId);
+    const finished=await (await api(context(`/api/upload-batches/${batchId}/complete`,{}))).json() as any;
+    expect(finished.path).toBe(`/collections/${batchId}`);
+    const page=await (await api(context(`/api/photos?batch=${batchId}`,undefined,member))).json() as any;
+    expect(page.photos.map((item:any)=>item.id)).toEqual(['new-picture']);
+    expect((await api(context(`/api/photos/new-picture`,undefined,member))).status).toBe(200);
+    await expect(api(context(`/api/upload-batches/${batchId}`,undefined,null))).rejects.toMatchObject({status:401});
+  });
+  it('keeps private collection and photo links private and sends no email',async()=>{
+    configureMail();const send=vi.mocked(sendSmtpEmail);
+    const batch=await create('private');picture('private-photo',batch.albumId);
+    await api(context(`/api/upload-batches/${batchId}/complete`,{}));
+    await expect(api(context(`/api/upload-batches/${batchId}`,undefined,member))).rejects.toMatchObject({status:404});
+    await expect(api(context('/api/photos/private-photo',undefined,member))).rejects.toMatchObject({status:404});
+    expect(send).not.toHaveBeenCalled();expect(db.prepare('SELECT email_state FROM upload_batches').get()?.email_state).toBe('private');
+  });
+  it('creates one collection/album when a creation request is retried',async()=>{
+    const first=await create();const second=await create();expect(second.id).toBe(first.id);
+    expect(db.prepare('SELECT COUNT(*) total FROM upload_batches').get()?.total).toBe(1);
+    expect(db.prepare('SELECT COUNT(*) total FROM albums').get()?.total).toBe(1);
+    await expect(api(context('/api/upload-batches',{id:batchId,title:'Hijack'},member))).rejects.toMatchObject({status:404});
+  });
+  it('emails only the configured active admin once, with secure and WhatsApp links',async()=>{
+    configureMail();const send=vi.mocked(sendSmtpEmail).mockResolvedValue({id:'email-id'});
+    const batch=await create();picture('p',batch.albumId);
+    await api(context(`/api/upload-batches/${batchId}/complete`,{}));await api(context(`/api/upload-batches/${batchId}/complete`,{}));
+    expect(send).toHaveBeenCalledTimes(1);
+    const payload=send.mock.calls[0][1];
+    expect(payload.to).toBe('admin@example.com');expect(payload.text).toContain(`https://family-vault.cipher126.workers.dev/collections/${batchId}`);expect(payload.text).toContain('https://wa.me/');
+    expect(db.prepare('SELECT email_provider_id FROM upload_batches').get()?.email_provider_id).toBe('email-id');
+  });
+  it('keeps a durable pending notification while email is unconfigured',async()=>{
+    const send=vi.mocked(sendSmtpEmail);const batch=await create();picture('p',batch.albumId);
+    await api(context(`/api/upload-batches/${batchId}/complete`,{}));
+    expect(db.prepare('SELECT email_state FROM upload_batches').get()?.email_state).toBe('pending');expect(send).not.toHaveBeenCalled();
+    configureMail();send.mockResolvedValue({id:'later'});
+    db.exec("UPDATE upload_batches SET email_next_attempt_at=datetime('now','-1 minute')");await retryUploadEmails(env);expect(send).toHaveBeenCalledTimes(1);
+  });
+  it('retries SMTP failures using the same message identity',async()=>{
+    configureMail();const send=vi.mocked(sendSmtpEmail).mockRejectedValueOnce(new Error('SMTP unavailable')).mockResolvedValueOnce({id:'retry'});
+    const batch=await create();picture('p',batch.albumId);await api(context(`/api/upload-batches/${batchId}/complete`,{}));
+    db.exec("UPDATE upload_batches SET email_next_attempt_at=datetime('now','-1 minute')");await deliverUploadEmail(env,batchId);
+    expect(send.mock.calls[0][1].id).toBe(send.mock.calls[1][1].id);
+    expect(db.prepare('SELECT email_attempts FROM upload_batches').get()?.email_attempts).toBe(2);
+  });
+  it('does not email the configured address if its admin access was revoked',async()=>{
+    configureMail();db.exec("UPDATE users SET status='revoked' WHERE id='a'");const send=vi.mocked(sendSmtpEmail);
+    const batch=await create();picture('p',batch.albumId);await api(context(`/api/upload-batches/${batchId}/complete`,{}));expect(send).not.toHaveBeenCalled();
+  });
 });

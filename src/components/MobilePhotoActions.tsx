@@ -1,12 +1,13 @@
+import {PhotoShareMenuItems} from "./ShareActions";
 import { useEffect, useState } from "react";
-import { Album as AlbumIcon, ArrowLeft, Download, Heart, Image, MessageCircle, Pencil, Smile, Trash2, Users } from "lucide-react";
+import { Album as AlbumIcon, ArrowLeft, Download, Heart, Image, MessageCircle, Pencil, Share2, Smile, Trash2, Users } from "lucide-react";
 import type { Album, Reaction } from "../lib/api";
 
-export default function MobilePhotoActions({ open, albums, reactions, downloadUrl, canEdit, canManageAlbum, onClose, onAlbum, onEdit, onDelete, onReaction, onNotes, onPeople, onCover, onRemove }: {
-  open:boolean; albums:Album[]; reactions:Reaction[]; downloadUrl:string; canEdit:boolean; canManageAlbum:boolean;
+export default function MobilePhotoActions({ photoId,photoTitle,open, albums, reactions, downloadUrl, canEdit, canManageAlbum, onClose, onAlbum, onEdit, onDelete, onReaction, onNotes, onPeople, onCover, onRemove }: {
+  photoId:string;photoTitle:string;open:boolean; albums:Album[]; reactions:Reaction[]; downloadUrl:string; canEdit:boolean; canManageAlbum:boolean;
   onClose:()=>void; onAlbum:(id:string)=>Promise<void>; onEdit:()=>void; onDelete:()=>void; onReaction:(emoji:Reaction["emoji"])=>Promise<void>; onNotes:()=>void; onPeople:()=>void; onCover:()=>Promise<void>; onRemove:()=>void;
 }) {
-  const [section,setSection] = useState<"actions"|"albums"|"reactions">("actions");
+  const [section,setSection] = useState<"actions"|"albums"|"reactions"|"share">("actions");
   const [busy,setBusy] = useState(false);
   const [error,setError] = useState("");
   useEffect(()=>{ if (open) {setSection("actions");setError("");} },[open]);
@@ -15,9 +16,10 @@ export default function MobilePhotoActions({ open, albums, reactions, downloadUr
   const save = async (action:()=>Promise<void>) => {setBusy(true);setError("");try {await action();onClose();}catch(reason){setError(reason instanceof Error ? reason.message : "Unable to complete this action.");}finally{setBusy(false);}};
   return <div className="mobile-photo-actions">
     <button className="mobile-photo-action-scrim" aria-label="Dismiss photo actions" onClick={onClose}/>
-    <div className="mobile-photo-action-menu" role="menu" aria-label={section === "albums" ? "Choose an album" : section === "reactions" ? "Choose a reaction" : "Photo actions"}>
+    <div className="mobile-photo-action-menu" role="menu" aria-label={section === "share" ? "Share photograph" : section === "albums" ? "Choose an album" : section === "reactions" ? "Choose a reaction" : "Photo actions"}>
       {section !== "actions" && <button role="menuitem" onClick={()=>setSection("actions")}><ArrowLeft size={18}/>Back</button>}
-      {section === "albums" ? <>{albums.length ? albums.map(album=><button role="menuitem" key={album.id} disabled={busy} onClick={()=>void save(()=>onAlbum(album.id))}><AlbumIcon size={18}/><span>{album.name}</span></button>) : <p>Create an album first.</p>}</> : section === "reactions" ? <>{([['heart','Love'],['smile','Smile'],['celebrate','Celebrate']] as const).map(([emoji,label])=><button role="menuitem" key={emoji} disabled={busy} onClick={()=>void save(()=>onReaction(emoji))}><Heart size={18}/>{reactions.find(r=>r.emoji===emoji)?.mine ? `Remove ${label.toLowerCase()}` : label}</button>)}</> : <>
+      {section === "share" ? <PhotoShareMenuItems id={photoId} title={photoTitle}/> : section === "albums" ? <>{albums.length ? albums.map(album=><button role="menuitem" key={album.id} disabled={busy} onClick={()=>void save(()=>onAlbum(album.id))}><AlbumIcon size={18}/><span>{album.name}</span></button>) : <p>Create an album first.</p>}</> : section === "reactions" ? <>{([['heart','Love'],['smile','Smile'],['celebrate','Celebrate']] as const).map(([emoji,label])=><button role="menuitem" key={emoji} disabled={busy} onClick={()=>void save(()=>onReaction(emoji))}><Heart size={18}/>{reactions.find(r=>r.emoji===emoji)?.mine ? `Remove ${label.toLowerCase()}` : label}</button>)}</> : <>
+        <button role="menuitem" onClick={()=>setSection("share")}><Share2 size={18}/>Share photograph</button>
         <button role="menuitem" onClick={()=>setSection("albums")}><AlbumIcon size={18}/>Add to album</button>
         {canEdit && <button role="menuitem" onClick={()=>run(onEdit)}><Pencil size={18}/>Edit photograph</button>}
         <a role="menuitem" href={downloadUrl} onClick={onClose}><Download size={18}/>Download original</a>

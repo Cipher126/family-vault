@@ -1,3 +1,5 @@
+import {cleanupFiles} from './routes/files';
+import {retryUploadEmails} from "./lib/upload-email";
 import { currentUser } from "./lib/auth";
 import { HttpError, json } from "./lib/http";
 import { securityHeaders } from "./lib/security";
@@ -5,7 +7,7 @@ import { api, serveAuthenticatedPhoto } from "./routes/api";
 import type { Env } from "./types";
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, execution: ExecutionContext): Promise<Response> {
     try {
       const url = new URL(request.url);
       if (url.pathname === "/robots.txt") return new Response("User-agent: *\nDisallow: /\n", { headers: { "Content-Type": "text/plain", "Cache-Control": "public, max-age=86400" } });
@@ -13,7 +15,7 @@ export default {
         const media=url.pathname.match(/^\/api\/photos\/([^/]+)\/(small|thumbnail|gallery|viewer|original)$/);
         if(request.method==="GET" && media) return securityHeaders(await serveAuthenticatedPhoto(request,env,media[1],media[2]),env);
         const user = await currentUser(request, env);
-        return securityHeaders(await api({ request, env, url, user }), env);
+        return securityHeaders(await api({ request, env, url, user, execution }), env);
       }
       const asset = await env.ASSETS.fetch(request);
       const headers = new Headers(asset.headers);
@@ -25,5 +27,6 @@ export default {
       console.error("Unhandled request error", error);
       return securityHeaders(json({ error: "Something went wrong. Please try again." }, { status: 500 }), env);
     }
-  }
+  },
+  async scheduled(_controller: ScheduledController,env:Env,execution:ExecutionContext) {execution.waitUntil(retryUploadEmails(env));execution.waitUntil(cleanupFiles(env));}
 } satisfies ExportedHandler<Env>;

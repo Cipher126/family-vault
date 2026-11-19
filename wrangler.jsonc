@@ -31,10 +31,14 @@
 			"preview_bucket_name": "family-vault-photos-dev"
 		}
 	],
+	"keep_vars": true,
 	"vars": {
 		"APP_ENV": "production",
-		"SESSION_TTL_DAYS": "30"
+		"SESSION_TTL_DAYS": "30",
+		"PUBLIC_APP_URL": "https://family-vault.cipher126.workers.dev",
+		"SMTP_HOST": "smtp.gmail.com"
 	},
+	"triggers": { "crons": ["*/10 * * * *"] },
 	"observability": {
 		"enabled": true
 	}
